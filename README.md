@@ -2,98 +2,223 @@
 
 # Polymarket-quant
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 ### Agentic Alpha Research with Deterministic Execution Governance
 
-**让 AI 负责发现 Alpha，让确定性系统负责保护资金。**
+**Let AI research and propose. Let deterministic systems constrain, audit, and control execution authority.**
 
-![Research](https://img.shields.io/badge/Research-CLOSED-2ea44f?style=flat-square)
-![SHADOW](https://img.shields.io/badge/SHADOW-CLOSED-2ea44f?style=flat-square)
-![Execution Evidence](https://img.shields.io/badge/Execution%20Evidence-CLOSED-2ea44f?style=flat-square)
+![Agent Shadow](https://img.shields.io/badge/K3%2FJev%20Agent%20Shadow-MERGED-2ea44f?style=flat-square)
+![Post-merge CI](https://img.shields.io/badge/Post--merge%20CI-PASS-2ea44f?style=flat-square)
+![Formal Backtest](https://img.shields.io/badge/Formal%20Backtest-NOT%20RUN-f0ad4e?style=flat-square)
 ![LIVE](https://img.shields.io/badge/LIVE-STOP-d73a49?style=flat-square)
 
 </div>
 
 ---
 
-`std0-quant` is an auditable quantitative research system for **Polymarket market microstructure research**.
+`std0-quant` is an auditable quantitative research system for **Polymarket BTC 5-minute Up/Down market microstructure research**.
 
-It separates two responsibilities:
+The system separates reasoning from authority:
 
-- **AI / Agent:** discover factors, validate hypotheses, generate strategy candidates.
-- **Deterministic System:** control risk, execution evidence, governance, and production eligibility.
+- **K3 / Agent layer:** analyzes point-in-time public state and produces structured research.
+- **Jev:** evaluates fixed, typed questions over the same bounded research state.
+- **Deterministic code:** enforces evidence, provenance, coverage, schema, and execution boundaries.
+- **Execution layer:** stays outside model authority.
 
-> **Research Brain THINK → Deterministic System ACT**
+> **K3 = REASONER · JEV = JUDGE · DETERMINISTIC CODE = AUTHORITY · SHADOW = ONLY OUTPUT**
 
-AI can research and propose.  
-AI cannot hold LIVE credentials, bypass the Risk Gate, promote itself to production, or submit real orders.
+AI can research and propose. AI cannot hold LIVE credentials, bypass deterministic gates, mutate formal cohort state, perform an actual publication, authorize a formal backtest, or submit real orders.
 
 ## Architecture
 
 ![std0-quant architecture](docs/assets/architecture.jpg)
 
-The system deliberately separates:
-
 ```text
-SHADOW PASS
-    ≠
-EXECUTION PASS
-    ≠
-PRODUCTION_ELIGIBLE
+Point-in-Time Data / Features
+            │
+            ▼
+      K3 Analyst Team
+            │
+            ▼
+       Bull / Bear
+            │
+            ▼
+    Research Manager
+            │
+            ▼
+     Jev Typed Judge
+            │
+            ▼
+   Deterministic Gate
+            │
+            ▼
+        SHADOW ONLY
 ```
 
-## Core Capabilities
+The current K3 / Jev layer is a **research classification layer**, not a trading engine.
 
-- Agentic factor discovery
-- Out-of-sample / null / baseline validation
-- Temporal stability testing
-- Versioned Factor Registry
-- Alpha → Strategy Candidate composition
-- Deterministic Risk Gate
-- SHADOW execution
-- Execution provenance
-- Measured venue telemetry validation
-- Production eligibility governance
-- Hash-bound, auditable artifacts
+```text
+AGENT SHADOW ACCEPT
+        ≠
+STRATEGY EXECUTION SHADOW
+        ≠
+FORMAL BACKTEST
+        ≠
+PRODUCTION ELIGIBLE
+        ≠
+LIVE
+```
+
+## K3 / Jev Agent Shadow
+
+The agent-shadow implementation lives under:
+
+```text
+src/std0_quant/research/agent_shadow/
+```
+
+Core properties:
+
+- fixed analyst roles;
+- one bounded Bull/Bear debate round;
+- one Research Manager synthesis step;
+- explicit role-specific instructions;
+- typed Jev question contracts;
+- explicit Jev model version pinning;
+- request / evidence hash binding;
+- point-in-time input allowlists;
+- deterministic fail-closed classification;
+- temporary-only shadow artifact writing;
+- no order or production-authority capability.
+
+### Deterministic authority
+
+The final shadow classification is made by code, not by model text.
+
+Possible outcomes:
+
+```text
+SHADOW_ACCEPT
+SHADOW_REJECT
+BLOCKED
+```
+
+A model cannot directly turn a research opinion into an executable instruction.
+
+## Point-in-Time Boundary
+
+The agent layer only receives explicitly allowlisted pre-cutoff public features.
+
+Examples include:
+
+- BTC price / return / realized-volatility features;
+- BTC trade-count / volume / signed-flow features;
+- Polymarket mid / spread / depth / OBI features;
+- short-horizon book-update features;
+- explicit observation timestamps;
+- measured coverage fields.
+
+Unknown or forbidden fields fail closed. Observed timestamps must not exceed the decision cutoff.
+
+## Coverage Gates
+
+The current research boundary keeps the existing coverage thresholds unchanged:
+
+```text
+BTC_PRE30  >= 0.99
+BOOK_PRE10 >= 0.99
+```
+
+Passing a coverage or numeric-sanity rule does **not** imply:
+
+- formal cohort membership;
+- formal strategy eligibility;
+- complete lineage;
+- profitability;
+- backtest approval;
+- LIVE readiness.
+
+## Publication / Provenance
+
+Publication / Provenance v2 is merged into `main` as a versioned publication layer.
+
+It is designed to preserve:
+
+- behavioral truth;
+- reconciliation evidence;
+- provenance membership;
+- artifact identity;
+- hash-bound auditability.
+
+Important distinction:
+
+```text
+PUBLICATION / PROVENANCE CODE MERGED
+                ≠
+ACTUAL PUBLISH EXECUTED
+```
+
+The repository does **not** claim that an actual publication has been run.
 
 ## Safety Boundary
 
-The LLM is not part of the millisecond execution path.
+The LLM / agent layer is not part of the millisecond execution path.
 
-The Agent cannot:
+The agent layer cannot:
 
 - load private keys or LIVE credentials;
 - submit real venue orders;
 - bypass deterministic risk controls;
-- modify frozen research semantics;
-- directly promote Factors;
+- mutate frozen research semantics;
+- overwrite pinned feature or provenance artifacts;
+- write the formal cohort;
+- authorize a formal backtest;
+- perform an actual publication;
 - authorize Production Eligibility.
 
-The system is designed to **fail closed** when evidence, identity, provenance, or accounting is inconsistent.
+The system is designed to **fail closed** when identity, point-in-time state, evidence, provenance, coverage, schema, or audit hashes are inconsistent.
 
 ## Current Status
 
 | Layer | Status |
 | --- | :---: |
-| Research / Validation | CLOSED |
-| Factor Factory | CLOSED |
-| Alpha Factory | CLOSED |
-| Risk Gate | CLOSED |
-| SHADOW Execution | CLOSED |
-| Execution Evidence | CLOSED |
-| Production Governance | CLOSED |
-| **LIVE Execution** | **STOP** |
+| Sanity Audit v2 | FROZEN |
+| 243-conflict forensics | CLOSED / PASS |
+| Publication / Provenance v2 code | MERGED TO `main` |
+| Actual publish | NOT RUN |
+| K3 / Jev agent research shadow | MERGED TO `main` |
+| Post-merge GitHub Actions CI | PASS |
+| Formal cohort | EMPTY |
+| Formal backtest | NOT RUN |
+| Strategy execution shadow | NOT STARTED |
+| Real order submission | DISABLED |
+| **LIVE execution** | **STOP** |
 
-> **LIVE Execution is not authorized.**
+Verified code baseline after PR #28:
+
+```text
+main = 1cbca74943225ec40fd46bfafcd77888b2a8150f
+```
+
+K3 / Jev feature commit:
+
+```text
+e0095ed8de17708cc66fd21c287d1c4ce4f51d22
+```
 
 ## Repository Layout
 
 ```text
 src/std0_quant/
 ├── alpha/
+├── events/
 ├── execution/
 ├── factors/
+├── features/
 ├── registry/
 ├── research/
+│   └── agent_shadow/
 └── risk/
 
 tests/
@@ -109,19 +234,55 @@ git clone https://github.com/howei-ai/Polymarket-quant.git
 cd Polymarket-quant
 ```
 
-This repository is intended for **quantitative research, execution validation, and production governance**.
+This repository is intended for:
 
-It should not be interpreted as:
+- quantitative research;
+- point-in-time feature analysis;
+- agent-assisted research;
+- execution validation;
+- provenance / publication governance;
+- production-readiness controls.
+
+It should **not** be interpreted as:
 
 - an AI auto-profit bot;
-- proof of long-term profitability;
-- deployed LIVE trading;
+- proof of profitability;
+- a completed formal backtest;
+- a deployed LIVE trading system;
 - completed production trading authorization.
+
+## Governance Model
+
+The repository follows an explicit staged workflow:
+
+```text
+develop / test
+      ↓
+independent review
+      ↓
+local commit
+      ↓
+remote push
+      ↓
+pull request
+      ↓
+CI
+      ↓
+merge
+      ↓
+post-merge CI
+      ↓
+separate server / publish / backtest / LIVE gates
+```
+
+Authorization for one stage does not automatically authorize the next stage.
 
 ## Design Principle
 
 ```text
-Learn
+Observe
+  ↓
+Research
   ↓
 Candidate
   ↓
@@ -129,19 +290,21 @@ Validate
   ↓
 Version
   ↓
-Deploy
+Govern
+  ↓
+Shadow
 ```
 
 Never:
 
 ```text
-Learn → Production
+Model Opinion → Production
 ```
 
 ---
 
 <div align="center">
 
-**Research Brain THINK · Deterministic System ACT**
+**K3 REASONS · JEV JUDGES · DETERMINISTIC CODE DECIDES · LIVE STAYS GATED**
 
 </div>
