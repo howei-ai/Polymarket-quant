@@ -23,6 +23,8 @@ dependencies = [
     "scikit-learn>=1.5",
     "psutil>=5.9",
     "cryptography==50.0.1",
+    "anthropic==2.3.0",
+    "openai==3.42.1",
 ]
 
 [project.optional-dependencies]

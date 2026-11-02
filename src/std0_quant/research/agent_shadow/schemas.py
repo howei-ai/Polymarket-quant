@@ -13,6 +13,8 @@ ANALYST_ROLES = ("MICROSTRUCTURE", "MOMENTUM", "LIQUIDITY", "REGIME")
 DEBATE_ROLES = ("BULL_RESEARCHER", "BEAR_RESEARCHER")
 K3_ROLES = ANALYST_ROLES + DEBATE_ROLES + ("RESEARCH_MANAGER",)
 COMPARISON_ARMS = ("BASELINE", "K3_ONLY", "K3_PLUS_JEV")
+CALL_OUTCOMES = ("OK", "REFUSAL", "TRUNCATED", "UNEXPECTED_STOP", "SERVED_MODEL_MISMATCH",
+                 "INVALID_OUTPUT", "API_ERROR", "TIMEOUT", "BUDGET_EXCEEDED", "INPUT_TOO_LARGE")
 
 
 def _mapping(raw: Any, keys: set[str], name: str) -> Mapping[str, Any]:
@@ -133,6 +135,47 @@ class JevJudgments:
 
 
 @dataclass(frozen=True)
+class ModelCallRecord:
+    """Metadata of one provider call; never prompt text, model output, or credentials."""
+    role: str
+    provider: str
+    requested_model_id: str
+    served_model_id: str | None
+    request_id: str | None
+    outcome: str
+    detail: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: float | None
+    cost_is_upper_bound: bool
+    test_client: bool
+
+    def __post_init__(self) -> None:
+        if self.role not in K3_ROLES + ("JEV",):
+            raise ValueError("model call role must be a K3 role or JEV")
+        if self.outcome not in CALL_OUTCOMES:
+            raise ValueError("unknown model call outcome")
+        for name in ("provider", "requested_model_id"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ValueError(f"{name} required")
+        for name in ("served_model_id", "request_id", "detail"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or len(value) > 200):
+                raise ValueError(f"{name} must be a short string or null")
+        for name in ("input_tokens", "output_tokens"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a nonnegative integer or null")
+        cost = self.cost_usd
+        if cost is not None and (type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0):
+            raise ValueError("cost_usd must be finite and nonnegative or null")
+        if type(self.cost_is_upper_bound) is not bool or (self.cost_is_upper_bound and cost is None):
+            raise ValueError("cost_is_upper_bound must be boolean and requires cost_usd")
+        if type(self.test_client) is not bool:
+            raise ValueError("test_client must be boolean")
+
+
+@dataclass(frozen=True)
 class ShadowResult:
     schema_version: str
     condition_id: str
@@ -148,6 +191,11 @@ class ShadowResult:
     jev_question_schema_version: str
     jev_request_hash: str
     jev_response_hash: str
+    k3_provider: str
+    k3_transport_version: str
+    jev_provider: str
+    jev_transport_version: str
+    model_calls: tuple[ModelCallRecord, ...]
     analyst_reports: tuple[AnalystReport, ...]
     bull_report: AnalystReport | None
     bear_report: AnalystReport | None
@@ -170,6 +218,13 @@ class ShadowResult:
             raise ValueError("SHADOW_ACCEPT requires all hard evidence true")
         if self.execution_allowed is not False or self.formal_cohort_effect is not False:
             raise ValueError("SHADOW artifact cannot authorize execution or cohort mutation")
+        for name in ("k3_provider", "k3_transport_version", "jev_provider", "jev_transport_version"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ValueError(f"{name} required")
+        if not isinstance(self.model_calls, tuple) or any(
+            not isinstance(call, ModelCallRecord) for call in self.model_calls
+        ):
+            raise TypeError("model_calls must be a tuple of ModelCallRecord")
         hashes = (self.input_feature_sha256, self.context_sha256, self.jev_request_hash,
                   self.jev_response_hash, *self.k3_request_hashes.values(),
                   *self.k3_response_hashes.values())
