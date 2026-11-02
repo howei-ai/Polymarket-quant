@@ -9,7 +9,7 @@ from std0_quant.research.agent_shadow.schemas import GateEvidence, JevJudgments
 
 def test_jev_adapter_disabled_and_latest_rejected():
     called = []
-    client = JevClient(model_id="jev-1.13.0", transport=lambda state, questions: called.append(questions) or {})
+    client = JevClient(model_id="gpt-6.1-sol", transport=lambda state, questions: called.append(questions) or {})
     with pytest.raises(ModelUnavailable):
         client.judge({}, ())
     with pytest.raises(ValueError):
@@ -39,16 +39,17 @@ def test_jev_timeout_blocks_and_records_request():
 def test_real_jev_client_requires_explicit_model_id():
     with pytest.raises(TypeError):
         JevClient()
-    assert JevClient(model_id="jev-1.13.0").model_id == "jev-1.13.0"
+    assert JevClient(model_id="gpt-6.1-sol").model_id == "gpt-6.1-sol"
 
 
-@pytest.mark.parametrize("model_id", ["jev-latest", "latest", "JEV-LATEST", ""])
+@pytest.mark.parametrize("model_id", ["jev-latest", "latest", "JEV-LATEST", "", "gpt-6.1-sol-latest"])
 def test_real_jev_client_rejects_latest_alias(model_id):
     with pytest.raises(ValueError):
         JevClient(model_id=model_id)
 
 
-@pytest.mark.parametrize("model_id", ["jev-1", "jev-1.13", "jev-unconfigured-v1", "other-1.2.3"])
-def test_real_jev_client_rejects_unversioned_id(model_id):
+@pytest.mark.parametrize("model_id", ["jev-1", "jev-1.13", "jev-unconfigured-v1", "other-1.2.3",
+                                      "jev-1.13.0", "gpt-6-sol", "claude-fable-5-1", "kimi-k3"])
+def test_real_jev_client_rejects_unregistered_model_id(model_id):
     with pytest.raises(ValueError):
         JevClient(model_id=model_id)

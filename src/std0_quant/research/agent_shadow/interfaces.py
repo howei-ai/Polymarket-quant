@@ -9,6 +9,10 @@ class ModelUnavailable(RuntimeError):
     """Model explicitly unavailable, including timeout or disabled network."""
 
 
+class ModelTimeout(ModelUnavailable, TimeoutError):
+    """Provider call timed out; the runner records it as a model timeout."""
+
+
 class ReasoningModel(Protocol):
     model_id: str
 

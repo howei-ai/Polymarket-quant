@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
 from typing import Any, Mapping
 
@@ -14,11 +15,12 @@ from .interfaces import ProbabilisticJudge, ReasoningModel
 from .jev_questions import JEV_QUESTION_SCHEMA_VERSION, build_jev_request
 from .research_manager import manager_request, validate_manager_synthesis
 from .schemas import (ANALYST_ROLES, DEBATE_ROLES, AnalystReport, GateEvidence,
-                      JevJudgments, ManagerReport, ShadowResult)
+                      JevJudgments, ManagerReport, ModelCallRecord, ShadowResult)
 
 
-SHADOW_SCHEMA_VERSION = "k3_jev_agent_shadow_v1"
+SHADOW_SCHEMA_VERSION = "k3_jev_agent_shadow_v2"
 _EMPTY_HASH = sha256_json(None)
+_LOG = logging.getLogger(__name__)
 
 
 def _response_hash(raw: Any) -> str:
@@ -28,8 +30,24 @@ def _response_hash(raw: Any) -> str:
         return sha256_json({"unserializable_response_type": type(raw).__name__})
 
 
+def _model_label(model: Any, name: str) -> str:
+    value = getattr(model, name, None)
+    return value if isinstance(value, str) and value.strip() else "unspecified"
+
+
+def _drain_calls(model: Any) -> tuple[ModelCallRecord, ...]:
+    drain = getattr(model, "drain_call_records", None)
+    records = tuple(drain()) if callable(drain) else ()
+    if any(not isinstance(record, ModelCallRecord) for record in records):
+        raise TypeError("model call records must be ModelCallRecord")
+    return records
+
+
 class ShadowRunner:
-    """Exactly four analysts, one bull/bear round, one manager and one judge."""
+    """Exactly four analysts, one bull/bear round, one manager and one judge.
+
+    Not thread-safe: use one runner (with its own transports) per thread.
+    """
 
     def __init__(self, reasoner: ReasoningModel, judge: ProbabilisticJudge, *, rounds: int = 1) -> None:
         if type(rounds) is not int or rounds != 1:
@@ -46,6 +64,12 @@ class ShadowRunner:
     def run(self, row: Mapping[str, Any], evidence: GateEvidence) -> ShadowResult:
         if not isinstance(evidence, GateEvidence):
             raise TypeError("GateEvidence required")
+        # Records left by calls outside run() must not be attributed to this row; log metadata only.
+        stale = _drain_calls(self.reasoner) + _drain_calls(self.judge)
+        if stale:
+            _LOG.warning("discarded %d model call records not made by run(): roles=%s outcomes=%s cost_usd=%.6f",
+                         len(stale), [r.role for r in stale], [r.outcome for r in stale],
+                         sum(r.cost_usd or 0.0 for r in stale))
         cid = row.get("condition_id") if isinstance(row, Mapping) else None
         if not isinstance(cid, str) or not cid.strip():
             cid = "UNKNOWN"
@@ -79,6 +103,11 @@ class ShadowRunner:
                 jev_question_schema_version=JEV_QUESTION_SCHEMA_VERSION,
                 jev_request_hash=jev_request_hash,
                 jev_response_hash=jev_response_hash,
+                k3_provider=_model_label(self.reasoner, "provider"),
+                k3_transport_version=_model_label(self.reasoner, "transport_version"),
+                jev_provider=_model_label(self.judge, "provider"),
+                jev_transport_version=_model_label(self.judge, "transport_version"),
+                model_calls=_drain_calls(self.reasoner) + _drain_calls(self.judge),
                 analyst_reports=tuple(analysts),
                 bull_report=bull,
                 bear_report=bear,
@@ -136,18 +165,18 @@ class ShadowRunner:
             reason = "K3_TIMEOUT" if isinstance(exc, TimeoutError) else "K3_OUTPUTS_INVALID"
             return result("BLOCKED", (reason,))
 
-        state = {
-            "context": context.to_dict(),
-            "analyst_reports": [asdict(report) for report in analysts],
-            "bull_report": asdict(bull),
-            "bear_report": asdict(bear),
-            "manager_report": asdict(manager),
-        }
-        question_request = build_jev_request(
-            self.judge.model_id, state, schema_version=JEV_QUESTION_SCHEMA_VERSION,
-        )
-        jev_request_hash = sha256_json(question_request)
         try:
+            state = {
+                "context": context.to_dict(),
+                "analyst_reports": [asdict(report) for report in analysts],
+                "bull_report": asdict(bull),
+                "bear_report": asdict(bear),
+                "manager_report": asdict(manager),
+            }
+            question_request = build_jev_request(
+                self.judge.model_id, state, schema_version=JEV_QUESTION_SCHEMA_VERSION,
+            )
+            jev_request_hash = sha256_json(question_request)
             raw = self.judge.judge(question_request["state"], question_request["questions"])
             jev_response_hash = _response_hash(raw)
             judgments = JevJudgments.parse(raw)
