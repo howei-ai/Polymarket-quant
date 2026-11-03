@@ -43,7 +43,11 @@ def _optional_text(value: str | None, name: str) -> str | None:
 
 
 def _keepalive_socket_options() -> list[tuple[int, int, int | bool]]:
-    """TCP keepalive as anthropic 2.3.0's default transport sets it (idle 60 s, interval 60 s, 5 probes)."""
+    """TCP keepalive exactly as anthropic 2.3.0's default transport builds it, applied to both SDKs
+    (openai 3.42.1 sets no keepalive by default): SO_KEEPALIVE, a 60 s probe interval, 5 probes and,
+    only where TCP_KEEPIDLE exists (not on macOS), a 60 s idle time. On macOS with TCP_KEEPINTVL
+    (this host) no idle time is set, so the OS default applies; only when TCP_KEEPINTVL is missing
+    on macOS does the 60 s go to TCP_KEEPALIVE, which there is the idle time."""
     options: list[tuple[int, int, int | bool]] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, True)]
     interval = getattr(socket, "TCP_KEEPINTVL", None)
     if interval is not None:

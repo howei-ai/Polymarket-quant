@@ -135,7 +135,7 @@ def require_registered_model(role: str, model_id: object) -> ModelBinding:
 def require_registered_identity(binding: object, role: str) -> ModelBinding:
     """Model identity, effort and prices are fixed; operational limits may only be tightened."""
     registered = binding_for(role)
-    if not isinstance(binding, ModelBinding) or any(
+    if type(binding) is not ModelBinding or any(  # exact type: a subclass could reprice calls
         getattr(binding, name) != getattr(registered, name) for name in _IDENTITY_FIELDS
     ):
         raise ValueError(f"{role} binding must keep the registered model identity, effort and prices")
@@ -147,12 +147,16 @@ def require_registered_identity(binding: object, role: str) -> ModelBinding:
 class Reservation:
     """Single-use hold returned by CostBudget.reserve and consumed by CostBudget.settle."""
 
-    __slots__ = ("amount", "settled", "_budget")
+    __slots__ = ("_amount", "settled", "_budget")
 
     def __init__(self, budget: "CostBudget", amount: float) -> None:
-        self.amount = amount
+        self._amount = amount
         self.settled = False
         self._budget = budget
+
+    @property
+    def amount(self) -> float:
+        return self._amount
 
 
 class CostBudget:
@@ -160,13 +164,16 @@ class CostBudget:
 
     reserve() holds a conservative upper bound before a call and returns a Reservation;
     settle() consumes it exactly once, releasing the hold and charging the actual (or,
-    when unknown, the reserved) amount. Thread-safe.
+    when unknown, the reserved) amount. A charge above its reservation means the upper
+    bound failed: the true amount is still charged and the budget locks, so every later
+    reserve() is refused. Thread-safe.
     """
 
     def __init__(self, limit_usd: float) -> None:
         self._limit = _positive(limit_usd, "limit_usd")
         self._spent = 0.0
         self._held = 0.0
+        self._locked = False
         self._lock = threading.Lock()
 
     @property
@@ -183,15 +190,23 @@ class CostBudget:
         with self._lock:
             return self._held
 
+    @property
+    def locked(self) -> bool:
+        with self._lock:
+            return self._locked
+
     def reserve(self, max_cost_usd: float) -> Reservation:
         amount = _nonnegative(max_cost_usd, "max_cost_usd")
         with self._lock:
+            if self._locked:
+                raise ModelUnavailable("model call budget locked after a charge exceeded its reservation")
             if self._spent + self._held + amount > self._limit:
                 raise ModelUnavailable("model call budget exceeded")
             self._held += amount
         return Reservation(self, amount)
 
-    def settle(self, reservation: Reservation, charged_usd: float) -> None:
+    def settle(self, reservation: Reservation, charged_usd: float) -> bool:
+        """Returns True when the charge exceeded the reservation (the budget is then locked)."""
         if not isinstance(reservation, Reservation) or reservation._budget is not self:
             raise ValueError("reservation does not belong to this budget")
         charged = _nonnegative(charged_usd, "charged_usd")
@@ -201,3 +216,7 @@ class CostBudget:
             reservation.settled = True
             self._held = max(0.0, self._held - reservation.amount)
             self._spent += charged
+            overrun = charged > reservation.amount
+            if overrun:
+                self._locked = True
+            return overrun

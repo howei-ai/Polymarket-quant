@@ -83,7 +83,7 @@ def test_network_enabled_clients_require_a_registered_transport():
 class _ImpersonatingTransport:
     """Claims the registered binding and a real transport version without being one."""
 
-    transport_version = "anthropic-k3-transport-v2"
+    transport_version = "anthropic-k3-transport-v3"
 
     def __init__(self, role):
         self.binding = binding_for(role)
@@ -127,7 +127,7 @@ def test_records_mark_test_clients_and_real_clients_differently(monkeypatch):
     monkeypatch.setattr(real_client, "with_options", lambda **options: FakeAnthropicClient())
     real_transport(_first_k3_request())
     (call,) = real_transport.drain_call_records()
-    assert call.test_client is False and real_transport.transport_version == "anthropic-k3-transport-v2"
+    assert call.test_client is False and real_transport.transport_version == "anthropic-k3-transport-v3"
 
 
 def test_transports_require_explicit_budget():
@@ -152,20 +152,20 @@ def test_transports_accept_only_factory_built_clients():
     k3 = AnthropicK3Transport(provider_clients.build_anthropic_client(environ=ANTHROPIC_KEY),
                               budget=CostBudget(1.0), allow_test_client=True)
     jev = OpenAIJevTransport(provider_clients.build_openai_client(environ=OPENAI_KEY), budget=CostBudget(1.0))
-    assert (k3.transport_version, jev.transport_version) == ("anthropic-k3-transport-v2", "openai-jev-transport-v2")
+    assert (k3.transport_version, jev.transport_version) == ("anthropic-k3-transport-v3", "openai-jev-transport-v3")
     fake = AnthropicK3Transport(FakeAnthropicClient(), budget=CostBudget(1.0), allow_test_client=True)
-    assert fake.transport_version == "anthropic-k3-transport-v2-test-client"
+    assert fake.transport_version == "anthropic-k3-transport-v3-test-client"
 
 
 def test_registered_end_to_end_accepts_and_audits_every_call():
     anthropic_client, openai_client, budget = FakeAnthropicClient(), FakeOpenAIClient(), CostBudget(5.0)
     result = _run(anthropic_client, openai_client, budget)
     assert result.gate_status == "SHADOW_ACCEPT"
-    assert result.schema_version == "k3_jev_agent_shadow_v2"
+    assert result.schema_version == "k3_jev_agent_shadow_v3"
     assert (result.k3_model_id, result.k3_provider, result.k3_transport_version) == (
-        "claude-fable-5-1", "anthropic", "anthropic-k3-transport-v2-test-client")
+        "claude-fable-5-1", "anthropic", "anthropic-k3-transport-v3-test-client")
     assert (result.jev_model_id, result.jev_provider, result.jev_transport_version) == (
-        "gpt-6.1-sol", "openai", "openai-jev-transport-v2-test-client")
+        "gpt-6.1-sol", "openai", "openai-jev-transport-v3-test-client")
     assert [call.role for call in result.model_calls] == list(K3_ROLES) + ["JEV"]
     assert all(call.outcome == "OK" and call.detail is None and call.cost_is_upper_bound is False
                and call.test_client is True for call in result.model_calls)
@@ -546,8 +546,8 @@ def test_anthropic_cache_tokens_are_charged_as_input():
                                      allow_test_client=True)
     transport(_first_k3_request())
     (call,) = transport.drain_call_records()
-    # 1200 uncached + 2 x 100 cache writes + 200 cache reads, all at the input price.
-    assert call.input_tokens == 1600 and math.isclose(call.cost_usd, (1600 * 10 + 300 * 50) / 1_000_000)
+    # Recorded raw: 1200 uncached + 100 cache writes + 200 cache reads; priced with writes at 2x.
+    assert call.input_tokens == 1500 and math.isclose(call.cost_usd, (1600 * 10 + 300 * 50) / 1_000_000)
 
 
 def test_budget_running_out_mid_run_blocks_the_next_call():

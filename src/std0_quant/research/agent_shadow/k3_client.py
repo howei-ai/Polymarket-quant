@@ -15,7 +15,7 @@ class K3Client:
         binding = require_registered_model("K3", binding_for("K3").model_id if model_id is None else model_id)
         if getattr(getattr(transport, "binding", None), "role", "K3") != "K3":
             raise ValueError("K3 transport is bound to a different role")
-        registered = isinstance(transport, AnthropicK3Transport)
+        registered = type(transport) is AnthropicK3Transport  # exact type: subclasses could relabel
         if network_enabled and not registered:
             raise ValueError("a network-enabled K3 client needs the registered Anthropic transport")
         # Only the registered transport class reports provider and version; other callables are "unspecified".
@@ -28,6 +28,8 @@ class K3Client:
     def analyze(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         if not self._enabled or self._transport is None:
             raise ModelUnavailable("K3 transport is disabled")
+        if type(self._transport) is not AnthropicK3Transport:  # transport swapped after network was enabled
+            raise ModelUnavailable("K3 transport is no longer the registered transport")
         return self._transport(request)
 
     def drain_call_records(self) -> tuple[Any, ...]:
