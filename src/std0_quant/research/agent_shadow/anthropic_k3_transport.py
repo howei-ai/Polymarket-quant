@@ -11,16 +11,16 @@ from typing import Any, Mapping
 
 from .audit import canonical_json
 from .interfaces import ModelTimeout, ModelUnavailable
-from .model_registry import CostBudget, ModelBinding, Reservation, binding_for, require_registered_identity
+from .model_registry import CostBudget, ModelBinding, Reservation, binding_for, require_registered_identity, route_for
 from .output_schemas import k3_output_schema
 from .provider_common import (
-    ANTHROPIC_BASE_URL, CallLedger, client_matches, error_detail, is_timeout, offline_call,
-    parse_json_object, request_size_bytes, require_trusted_client,
+    CallLedger, client_matches, error_detail, is_timeout, offline_call,
+    parse_json_object, request_size_bytes, require_trusted_client, route_refusal, transport_version_for,
 )
 from .schemas import K3_ROLES, ModelCallRecord
 
 
-TRANSPORT_VERSION = "anthropic-k3-transport-v3"
+TRANSPORT_VERSION = "anthropic-k3-transport-v4"
 SYSTEM_PROMPT = (
     "You are K3, the research reasoner in a shadow-only research pipeline. "
     "The user message is one JSON request: follow its instruction for its role, using only "
@@ -50,13 +50,14 @@ def _input_tokens(usage: Any) -> tuple[Any, Any]:
 
 class AnthropicK3Transport:
     def __init__(self, client: Any, *, budget: CostBudget, binding: ModelBinding | None = None,
-                 allow_test_client: bool = False) -> None:
+                 allow_test_client: bool = False, route: str = "official") -> None:
         self.binding = require_registered_identity(binding_for("K3") if binding is None else binding, "K3")
-        test_client = require_trusted_client(client, expected_base_url=ANTHROPIC_BASE_URL,
-                                             allow_test_client=allow_test_client)
-        self.transport_version = TRANSPORT_VERSION + ("-test-client" if test_client else "")
+        expected_base_url = route_for(route).base_urls["anthropic"]
+        test_client = require_trusted_client(client, expected_base_url=expected_base_url,
+                                             allow_test_client=allow_test_client, route=route)
+        self.transport_version = transport_version_for(TRANSPORT_VERSION, route, test_client)
         self._client = client
-        self._ledger = CallLedger(self.binding, budget, test_client=test_client)
+        self._ledger = CallLedger(self.binding, budget, test_client=test_client, route=route)
 
     def drain_call_records(self) -> tuple[ModelCallRecord, ...]:
         return self._ledger.drain()
@@ -68,9 +69,14 @@ class AnthropicK3Transport:
             require_registered_identity(self.binding, "K3")
         except (TypeError, ValueError):
             return False
+        try:
+            route = route_for(self._ledger.route)
+        except ValueError:
+            return False
         return (self._ledger.binding is self.binding
-                and self.transport_version == TRANSPORT_VERSION + ("-test-client" if test_client is True else "")
-                and client_matches(self._client, expected_base_url=ANTHROPIC_BASE_URL, test_client=test_client))
+                and self.transport_version == transport_version_for(TRANSPORT_VERSION, route.name, test_client)
+                and client_matches(self._client, expected_base_url=route.base_urls["anthropic"],
+                                   test_client=test_client, route=route.name))
 
     def __call__(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         role = request.get("role") if isinstance(request, Mapping) else None
@@ -80,6 +86,10 @@ class AnthropicK3Transport:
         if not AnthropicK3Transport._client_still_trusted(self):  # class function: an instance override is ignored
             ledger.record(role, "CLIENT_UNTRUSTED")
             raise ModelUnavailable("K3 client no longer matches its trust level")
+        refusal = route_refusal(ledger.route)
+        if refusal is not None:  # relay without opt-in, or a route other than the row's
+            ledger.record(role, refusal)
+            raise ModelUnavailable(f"K3 call refused by the route policy: {refusal}")
         payload = canonical_json(request)
         schema = k3_output_schema(role)
         size = request_size_bytes(SYSTEM_PROMPT, payload, schema)

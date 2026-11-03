@@ -168,7 +168,7 @@ def test_model_timeout_is_both_unavailable_and_timeout():
 def _record(**changes):
     base = dict(role="MOMENTUM", provider="anthropic", requested_model_id="claude-fable-5-1",
                 served_model_id="claude-fable-5-1", request_id="req_1", outcome="OK", detail=None,
-                input_tokens=1, output_tokens=2, cost_usd=0.1, cost_is_upper_bound=False, test_client=False)
+                input_tokens=1, output_tokens=2, cost_usd=0.1, cost_is_upper_bound=False, test_client=False, route="official")
     base.update(changes)
     return ModelCallRecord(**base)
 

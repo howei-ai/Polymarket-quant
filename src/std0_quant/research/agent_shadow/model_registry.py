@@ -144,6 +144,44 @@ def require_registered_identity(binding: object, role: str) -> ModelBinding:
     return binding
 
 
+@dataclass(frozen=True)
+class ProviderRoute:
+    """Where both providers' calls go and how their artifacts are labelled.
+
+    Base URLs and credential variables are fixed here; environment variables cannot retarget a
+    route. A relay route forwards both providers' requests to a third party: the backend model,
+    billing and data handling cannot be verified, so its artifacts carry UNVERIFIED_RELAY.
+    """
+    name: str
+    provenance: str
+    base_urls: MappingProxyType
+    key_env: MappingProxyType
+    version_suffix: str
+
+
+ROUTES = MappingProxyType({
+    "official": ProviderRoute(
+        name="official", provenance="OFFICIAL",
+        base_urls=MappingProxyType({"anthropic": "https://api.anthropic.com", "openai": "https://api.openai.com/v1"}),
+        key_env=MappingProxyType({"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}),
+        version_suffix="",
+    ),
+    "relay_mtu": ProviderRoute(
+        name="relay_mtu", provenance="UNVERIFIED_RELAY",
+        base_urls=MappingProxyType({"anthropic": "https://mtu.mtuopenai.xyz", "openai": "https://mtu.mtuopenai.xyz/v1"}),
+        key_env=MappingProxyType({"anthropic": "STD0_RELAY_API_KEY", "openai": "STD0_RELAY_API_KEY"}),
+        version_suffix="-relay-unverified",
+    ),
+})
+OFFICIAL_KEY_ENV = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+
+
+def route_for(name: object) -> ProviderRoute:
+    if type(name) is not str or name not in ROUTES:
+        raise ValueError(f"unknown provider route: {name!r}")
+    return ROUTES[name]
+
+
 class Reservation:
     """Single-use hold returned by CostBudget.reserve and consumed by CostBudget.settle."""
 

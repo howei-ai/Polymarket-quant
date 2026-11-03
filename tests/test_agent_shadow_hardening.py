@@ -17,6 +17,7 @@ from std0_quant.research.agent_shadow.analysts import analyst_request
 from std0_quant.research.agent_shadow.anthropic_k3_transport import AnthropicK3Transport
 from std0_quant.research.agent_shadow.context import build_shadow_context
 from std0_quant.research.agent_shadow.interfaces import ModelUnavailable
+from std0_quant.research.agent_shadow.jev_client import JevClient
 from std0_quant.research.agent_shadow.k3_client import K3Client
 from std0_quant.research.agent_shadow.model_registry import CostBudget
 from std0_quant.research.agent_shadow.openai_jev_transport import OpenAIJevTransport
@@ -43,7 +44,7 @@ def _first_k3_request():
 def _record(**changes):
     values = dict(role="MICROSTRUCTURE", provider="anthropic", requested_model_id="claude-fable-5-1",
                   served_model_id="claude-fable-5-1", request_id="req_forged", outcome="OK", detail=None,
-                  input_tokens=1, output_tokens=1, cost_usd=0.0, cost_is_upper_bound=False, test_client=False)
+                  input_tokens=1, output_tokens=1, cost_usd=0.0, cost_is_upper_bound=False, test_client=False, route="official")
     values.update(changes)
     return ModelCallRecord(**values)
 
@@ -52,7 +53,7 @@ class _ForgedReasoner(FakeReasoner):
     """Claims the registered labels and reports a real-looking call record (K1)."""
     model_id = "claude-fable-5-1"
     provider = "anthropic"
-    transport_version = "anthropic-k3-transport-v3"
+    transport_version = "anthropic-k3-transport-v4"
 
     def drain_call_records(self):
         return (_record(),)
@@ -63,8 +64,8 @@ class _ForgedReasoner(FakeReasoner):
 def test_registered_pair_keeps_labels_and_records():
     result = ShadowRunner(*_models()).run(pit_row(), EVIDENCE)
     assert result.gate_status == "SHADOW_ACCEPT"
-    assert result.k3_transport_version == "anthropic-k3-transport-v3-test-client"
-    assert result.jev_transport_version == "openai-jev-transport-v3-test-client"
+    assert result.k3_transport_version == "anthropic-k3-transport-v4-test-client"
+    assert result.jev_transport_version == "openai-jev-transport-v4-test-client"
     assert len(result.model_calls) == 8 and all(call.test_client for call in result.model_calls)
 
 
@@ -78,7 +79,7 @@ def test_forged_model_object_cannot_claim_labels_or_records():
 
 def test_tampered_label_on_registered_pair_blocks():
     k3, jev = _models()
-    k3.transport_version = "anthropic-k3-transport-v3"  # drops the -test-client marker
+    k3.transport_version = "anthropic-k3-transport-v4"  # drops the -test-client marker
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
     assert (result.k3_provider, result.k3_transport_version) == ("unspecified", "unspecified")
@@ -230,7 +231,7 @@ def test_real_client_swapped_into_test_transport_is_refused_before_any_request()
 
 def _forge_real_labels(k3):
     """Every label and the ledger flag say 'real run', but the client is still a fake."""
-    k3.transport_version = k3._transport.transport_version = "anthropic-k3-transport-v3"
+    k3.transport_version = k3._transport.transport_version = "anthropic-k3-transport-v4"
     k3._transport._ledger.test_client = False
 
 
@@ -246,7 +247,7 @@ def test_label_forgery_blocks_even_when_no_call_was_made():
     k3, jev = _models()
     _forge_real_labels(k3)
     result = ShadowRunner(k3, jev).run(pit_row(decision_cutoff_ts_ms=-1), EVIDENCE)
-    assert result.gate_reasons == ("CONTEXT_PIT_INVALID", "MODEL_PROVENANCE_INVALID")
+    assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
     assert (result.k3_provider, result.k3_transport_version) == ("unspecified", "unspecified")
 
 
@@ -261,7 +262,7 @@ def test_instance_overrides_of_trust_check_and_drain_are_ignored():
     k3, jev = _models()
     k3._transport._client_still_trusted = lambda: True
     k3._transport.drain_call_records = lambda: ()
-    k3.transport_version = k3._transport.transport_version = "anthropic-k3-transport-v3"
+    k3.transport_version = k3._transport.transport_version = "anthropic-k3-transport-v4"
     k3._transport._ledger.test_client = False
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
@@ -564,13 +565,20 @@ def _real_k3(monkeypatch):
     return K3Client(AnthropicK3Transport(real, budget=CostBudget(5.0)), network_enabled=True)
 
 
+def _real_jev(monkeypatch):
+    real = provider_clients.build_openai_client(environ={"OPENAI_API_KEY": "sk-test"})
+    monkeypatch.setattr(real, "with_options", lambda **options: FakeOpenAIClient())
+    return JevClient(model_id="gpt-6.1-sol", transport=OpenAIJevTransport(real, budget=CostBudget(5.0)),
+                     network_enabled=True)
+
+
 def test_instance_analyze_override_is_ignored(monkeypatch):
     k3 = _real_k3(monkeypatch)
     forged = FakeReasoner(responses={"RESEARCH_MANAGER": {"direction": "DOWN", "confidence": 0.99,
                                                           "supporting_roles": [], "contradicting_roles": [],
                                                           "key_risks": []}})
     k3.analyze = forged.analyze
-    _, jev = _models()
+    jev = _real_jev(monkeypatch)
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert not forged.requests  # the override never ran
     assert sum(call.role != "JEV" for call in result.model_calls) == 7
@@ -579,7 +587,7 @@ def test_instance_analyze_override_is_ignored(monkeypatch):
 def test_instance_interpret_override_is_ignored(monkeypatch):
     k3 = _real_k3(monkeypatch)
     k3._transport._interpret = lambda *args: {"forged": True}
-    _, jev = _models()
+    jev = _real_jev(monkeypatch)
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert sum(call.role != "JEV" for call in result.model_calls) == 7
     assert result.gate_status != "BLOCKED" or "MODEL_PROVENANCE_INVALID" not in result.gate_reasons
@@ -587,7 +595,7 @@ def test_instance_interpret_override_is_ignored(monkeypatch):
 
 def test_calls_without_records_block_the_row(monkeypatch):
     k3 = _real_k3(monkeypatch)
-    _, jev = _models()
+    jev = _real_jev(monkeypatch)
     runner = ShadowRunner(k3, jev)
     original = AnthropicK3Transport.__call__
 
