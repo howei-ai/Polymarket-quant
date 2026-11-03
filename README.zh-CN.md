@@ -91,6 +91,14 @@ src/std0_quant/research/agent_shadow/
 - 确定性 fail-closed classification；
 - 仅允许写入临时 shadow artifact；
 - 不具备订单或生产权限。
+- 模型来源校验（产物 schema `k3_jev_agent_shadow_v3`）：供应商标签和逐次调用记录只取自注册的 `K3Client` / `JevClient` 及其注册 transport；其他模型对象标为 `unspecified`，其自报的调用记录会被丢弃；来源不一致或预算超支时该行判为 BLOCKED；
+- 离线测试替身在调用期间受运行时防线（审计钩子）约束：仅针对发起调用的线程、仅在调用期间，拒绝新建 socket、建立连接、DNS 解析、启动线程、`subprocess` / `os.system` / `os.exec*` / `os.spawn*` / `posix_spawn` / `fork` 以及 ctypes 调用（调用期间首次导入并加载原生库也会被拒绝）。
+
+### 模型来源与离线替身的威胁边界
+
+覆盖（误用）：测试替身本身是、明显持有、隐藏或在调用时临时创建真实 SDK 客户端，并在调用期间新建连接；把工厂创建的真实客户端换进测试 transport（或把假客户端换进正式 transport）；替换绑定或价格（包括 `ModelBinding` 子类）；在实例上覆盖注册客户端或 transport 的方法；注册客户端的 transport 被替换；调用没有留下记录；伪造或改标签的模型对象；不一致的调用记录；预算超支。这些情况会被拒绝、记录为 `CLIENT_UNTRUSTED` / `BUDGET_EXCEEDED`，或令该行以 `MODEL_PROVENANCE_INVALID` / `BUDGET_OVERRUN` 判为 BLOCKED。
+
+不覆盖（需要签名产物或进程隔离）：同一进程内代码的故意篡改（例如围绕真实客户端重建注册类、修改防线状态）；在受保护调用开始前就已存在的线程、事件循环或连接上的网络 I/O（例如替身复用一个已用过的真实客户端连接池里的 keep-alive 连接）；不触发审计事件的原生代码，包括 macOS 上 `multiprocessing` 默认 spawn 方式启动的子进程；对工厂创建的真实客户端的方法做 monkeypatch（测试套件把它当作测试接缝，这类记录会被标为真实调用）。因此 Shadow 产物是进程内代码所记录内容的研究证据，而不是防篡改的证明。
 
 ### 确定性权威
 

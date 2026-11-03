@@ -6,21 +6,28 @@ import logging
 from dataclasses import asdict
 from typing import Any, Mapping
 
+from . import anthropic_k3_transport, openai_jev_transport
 from .analysts import K3_PROMPT_SCHEMA_VERSION, analyst_request
 from .audit import hash_k3_request, sha256_json
 from .context import ShadowContext, build_shadow_context
 from .debate import debate_request
 from .deterministic_gate import classify_shadow
 from .interfaces import ProbabilisticJudge, ReasoningModel
+from .jev_client import JevClient
 from .jev_questions import JEV_QUESTION_SCHEMA_VERSION, build_jev_request
+from .k3_client import K3Client
+from .provider_common import CallLedger
 from .research_manager import manager_request, validate_manager_synthesis
-from .schemas import (ANALYST_ROLES, DEBATE_ROLES, AnalystReport, GateEvidence,
+from .schemas import (ANALYST_ROLES, DEBATE_ROLES, K3_ROLES, AnalystReport, GateEvidence,
                       JevJudgments, ManagerReport, ModelCallRecord, ShadowResult)
 
 
-SHADOW_SCHEMA_VERSION = "k3_jev_agent_shadow_v2"
+SHADOW_SCHEMA_VERSION = "k3_jev_agent_shadow_v3"
 _EMPTY_HASH = sha256_json(None)
 _LOG = logging.getLogger(__name__)
+# (client class, transport class, transport version, roles) of each registered model path.
+_K3_PATH = (K3Client, anthropic_k3_transport.AnthropicK3Transport, anthropic_k3_transport.TRANSPORT_VERSION, K3_ROLES)
+_JEV_PATH = (JevClient, openai_jev_transport.OpenAIJevTransport, openai_jev_transport.TRANSPORT_VERSION, ("JEV",))
 
 
 def _response_hash(raw: Any) -> str:
@@ -30,17 +37,78 @@ def _response_hash(raw: Any) -> str:
         return sha256_json({"unserializable_response_type": type(raw).__name__})
 
 
-def _model_label(model: Any, name: str) -> str:
-    value = getattr(model, name, None)
-    return value if isinstance(value, str) and value.strip() else "unspecified"
-
-
 def _drain_calls(model: Any) -> tuple[ModelCallRecord, ...]:
     drain = getattr(model, "drain_call_records", None)
     records = tuple(drain()) if callable(drain) else ()
     if any(not isinstance(record, ModelCallRecord) for record in records):
         raise TypeError("model call records must be ModelCallRecord")
     return records
+
+
+def _registered_transport(model: Any, path: tuple[Any, ...]) -> Any:
+    """The transport of an exact registered client around the exact registered transport, else None."""
+    client_type, transport_type = path[0], path[1]
+    if type(model) is not client_type:
+        return None
+    transport = vars(model).get("_transport")
+    return transport if type(transport) is transport_type else None
+
+
+def _ledger_records(transport: Any) -> tuple[ModelCallRecord, ...]:
+    """Drains the transport's ledger through the class functions, so instance overrides are ignored."""
+    ledger = vars(transport).get("_ledger")
+    if type(ledger) is not CallLedger:
+        raise TypeError("registered transport must keep its CallLedger")
+    records = CallLedger.drain(ledger)
+    if any(not isinstance(record, ModelCallRecord) for record in records):
+        raise TypeError("model call records must be ModelCallRecord")
+    return records
+
+
+def _provenance(model: Any, path: tuple[Any, ...],
+                expected_roles: tuple[str, ...]) -> tuple[str, str, tuple[ModelCallRecord, ...], bool]:
+    """(provider, transport_version, call records, consistent) for one model.
+
+    Labels and records are taken only from the exact registered client wrapping the exact
+    registered transport whose client and binding still have the trust level its version claims
+    (checked through the class functions); any other object is "unspecified" and its
+    self-reported records are discarded. A registered pair whose client, binding, labels or
+    records disagree is inconsistent: labels become "unspecified", records are dropped, and the
+    row is BLOCKED. Each call the runner made (expected_roles, in order) must have exactly one
+    record, so outputs produced without the transport cannot carry genuine labels. A registered
+    client whose transport is no longer the registered one is inconsistent too. Deliberate
+    in-process tampering beyond this is outside the threat model (see README).
+    """
+    client_type, transport_type, version, roles = path
+    transport = _registered_transport(model, path)
+    if transport is None and type(model) is client_type:
+        return "unspecified", "unspecified", (), False
+    if transport is None:
+        try:
+            discarded = len(_drain_calls(model))
+        except Exception:
+            discarded = -1
+        if discarded:
+            _LOG.warning("discarded call records from an unregistered model object (count=%d)", discarded)
+        return "unspecified", "unspecified", (), True
+    try:
+        records = _ledger_records(transport)
+        binding = transport.binding
+        test_client = transport._ledger.test_client is True
+        expected_version = version + ("-test-client" if test_client else "")
+        consistent = (
+            transport_type._client_still_trusted(transport)
+            and model.transport_version == expected_version == transport.transport_version
+            and model.provider == binding.provider and model.model_id == binding.model_id
+            and all(record.provider == binding.provider and record.requested_model_id == binding.model_id
+                    and record.role in roles and record.test_client is test_client for record in records)
+            and tuple(record.role for record in records) == expected_roles
+        )
+    except Exception:
+        consistent = False
+    if not consistent:
+        return "unspecified", "unspecified", (), False
+    return model.provider, model.transport_version, records, True
 
 
 class ShadowRunner:
@@ -52,10 +120,15 @@ class ShadowRunner:
     def __init__(self, reasoner: ReasoningModel, judge: ProbabilisticJudge, *, rounds: int = 1) -> None:
         if type(rounds) is not int or rounds != 1:
             raise ValueError("only one bounded debate round is supported")
+        # Read once: a model attribute that later changes or raises cannot alter or break a row.
+        model_ids = []
         for model, name in ((reasoner, "K3"), (judge, "Jev")):
-            if not isinstance(getattr(model, "model_id", None), str) or not model.model_id.strip():
+            model_id = getattr(model, "model_id", None)
+            if not isinstance(model_id, str) or not model_id.strip():
                 raise TypeError(f"{name} requires a recorded model_id")
-        if "latest" in judge.model_id.lower():
+            model_ids.append(model_id)
+        self._k3_model_id, self._jev_model_id = model_ids
+        if "latest" in self._jev_model_id.lower():
             raise ValueError("Jev requires a versioned model_id")
         self.reasoner = reasoner
         self.judge = judge
@@ -65,7 +138,13 @@ class ShadowRunner:
         if not isinstance(evidence, GateEvidence):
             raise TypeError("GateEvidence required")
         # Records left by calls outside run() must not be attributed to this row; log metadata only.
-        stale = _drain_calls(self.reasoner) + _drain_calls(self.judge)
+        stale: tuple[ModelCallRecord, ...] = ()
+        for model, path in ((self.reasoner, _K3_PATH), (self.judge, _JEV_PATH)):
+            try:
+                transport = _registered_transport(model, path)
+                stale += _ledger_records(transport) if transport is not None else _drain_calls(model)
+            except Exception:  # registered models with unreadable records are BLOCKED by result(); others are unspecified
+                _LOG.warning("could not read stale model call records from %s", type(model).__name__)
         if stale:
             _LOG.warning("discarded %d model call records not made by run(): roles=%s outcomes=%s cost_usd=%.6f",
                          len(stale), [r.role for r in stale], [r.outcome for r in stale],
@@ -87,7 +166,18 @@ class ShadowRunner:
         manager: ManagerReport | None = None
         judgments: JevJudgments | None = None
 
+        k3_roles_called: list[str] = []
+        jev_roles_called: list[str] = []
+
         def result(status: str, reasons: tuple[str, ...]) -> ShadowResult:
+            k3_provider, k3_version, k3_calls, k3_consistent = _provenance(
+                self.reasoner, _K3_PATH, tuple(k3_roles_called))
+            jev_provider, jev_version, jev_calls, jev_consistent = _provenance(
+                self.judge, _JEV_PATH, tuple(jev_roles_called))
+            if not (k3_consistent and jev_consistent):
+                status, reasons = "BLOCKED", tuple(reasons) + ("MODEL_PROVENANCE_INVALID",)
+            if any(call.budget_overrun for call in k3_calls + jev_calls):
+                status, reasons = "BLOCKED", tuple(reasons) + ("BUDGET_OVERRUN",)
             return ShadowResult(
                 schema_version=SHADOW_SCHEMA_VERSION,
                 condition_id=cid,
@@ -95,19 +185,19 @@ class ShadowRunner:
                 input_feature_sha256=context.input_feature_sha256 if context else _EMPTY_HASH,
                 context_sha256=context.context_sha256 if context else _EMPTY_HASH,
                 gate_evidence=evidence,
-                k3_model_id=self.reasoner.model_id,
+                k3_model_id=self._k3_model_id,
                 k3_prompt_schema_version=K3_PROMPT_SCHEMA_VERSION,
                 k3_request_hashes=dict(requests),
                 k3_response_hashes=dict(responses),
-                jev_model_id=self.judge.model_id,
+                jev_model_id=self._jev_model_id,
                 jev_question_schema_version=JEV_QUESTION_SCHEMA_VERSION,
                 jev_request_hash=jev_request_hash,
                 jev_response_hash=jev_response_hash,
-                k3_provider=_model_label(self.reasoner, "provider"),
-                k3_transport_version=_model_label(self.reasoner, "transport_version"),
-                jev_provider=_model_label(self.judge, "provider"),
-                jev_transport_version=_model_label(self.judge, "transport_version"),
-                model_calls=_drain_calls(self.reasoner) + _drain_calls(self.judge),
+                k3_provider=k3_provider,
+                k3_transport_version=k3_version,
+                jev_provider=jev_provider,
+                jev_transport_version=jev_version,
+                model_calls=k3_calls + jev_calls,
                 analyst_reports=tuple(analysts),
                 bull_report=bull,
                 bear_report=bear,
@@ -138,9 +228,13 @@ class ShadowRunner:
             return result("BLOCKED", hard_reasons)
 
         def call_k3(role: str, request: dict[str, Any]) -> Mapping[str, Any]:
-            requests[role] = hash_k3_request(self.reasoner.model_id, request)
+            requests[role] = hash_k3_request(self._k3_model_id, request)
             try:
-                raw = self.reasoner.analyze(request)
+                k3_roles_called.append(role)
+                if _registered_transport(self.reasoner, _K3_PATH) is not None:
+                    raw = K3Client.analyze(self.reasoner, request)  # class function: instance overrides ignored
+                else:
+                    raw = self.reasoner.analyze(request)
             except Exception as exc:
                 responses[role] = sha256_json({"error_type": type(exc).__name__})
                 raise
@@ -174,10 +268,14 @@ class ShadowRunner:
                 "manager_report": asdict(manager),
             }
             question_request = build_jev_request(
-                self.judge.model_id, state, schema_version=JEV_QUESTION_SCHEMA_VERSION,
+                self._jev_model_id, state, schema_version=JEV_QUESTION_SCHEMA_VERSION,
             )
             jev_request_hash = sha256_json(question_request)
-            raw = self.judge.judge(question_request["state"], question_request["questions"])
+            jev_roles_called.append("JEV")
+            if _registered_transport(self.judge, _JEV_PATH) is not None:
+                raw = JevClient.judge(self.judge, question_request["state"], question_request["questions"])
+            else:
+                raw = self.judge.judge(question_request["state"], question_request["questions"])
             jev_response_hash = _response_hash(raw)
             judgments = JevJudgments.parse(raw)
         except Exception as exc:

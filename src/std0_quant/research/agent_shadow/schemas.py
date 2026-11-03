@@ -14,7 +14,8 @@ DEBATE_ROLES = ("BULL_RESEARCHER", "BEAR_RESEARCHER")
 K3_ROLES = ANALYST_ROLES + DEBATE_ROLES + ("RESEARCH_MANAGER",)
 COMPARISON_ARMS = ("BASELINE", "K3_ONLY", "K3_PLUS_JEV")
 CALL_OUTCOMES = ("OK", "REFUSAL", "TRUNCATED", "UNEXPECTED_STOP", "SERVED_MODEL_MISMATCH",
-                 "INVALID_OUTPUT", "API_ERROR", "TIMEOUT", "BUDGET_EXCEEDED", "INPUT_TOO_LARGE")
+                 "INVALID_OUTPUT", "API_ERROR", "TIMEOUT", "BUDGET_EXCEEDED", "INPUT_TOO_LARGE",
+                 "CLIENT_UNTRUSTED")
 
 
 def _mapping(raw: Any, keys: set[str], name: str) -> Mapping[str, Any]:
@@ -149,6 +150,8 @@ class ModelCallRecord:
     cost_usd: float | None
     cost_is_upper_bound: bool
     test_client: bool
+    billable_input_tokens: int | None = None  # priced input count; >= input_tokens (cache writes weigh more)
+    budget_overrun: bool = False  # charge exceeded its reservation, or refused because the budget locked
 
     def __post_init__(self) -> None:
         if self.role not in K3_ROLES + ("JEV",):
@@ -162,10 +165,13 @@ class ModelCallRecord:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or len(value) > 200):
                 raise ValueError(f"{name} must be a short string or null")
-        for name in ("input_tokens", "output_tokens"):
+        for name in ("input_tokens", "output_tokens", "billable_input_tokens"):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{name} must be a nonnegative integer or null")
+        if (self.billable_input_tokens is not None
+                and (self.input_tokens is None or self.billable_input_tokens < self.input_tokens)):
+            raise ValueError("billable_input_tokens requires input_tokens and cannot be below it")
         cost = self.cost_usd
         if cost is not None and (type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0):
             raise ValueError("cost_usd must be finite and nonnegative or null")
@@ -173,6 +179,8 @@ class ModelCallRecord:
             raise ValueError("cost_is_upper_bound must be boolean and requires cost_usd")
         if type(self.test_client) is not bool:
             raise ValueError("test_client must be boolean")
+        if type(self.budget_overrun) is not bool:
+            raise ValueError("budget_overrun must be boolean")
 
 
 @dataclass(frozen=True)

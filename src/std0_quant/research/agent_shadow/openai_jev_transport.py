@@ -14,13 +14,13 @@ from .interfaces import ModelTimeout, ModelUnavailable
 from .model_registry import CostBudget, ModelBinding, Reservation, binding_for, require_registered_identity
 from .output_schemas import jev_output_schema
 from .provider_common import (
-    OPENAI_BASE_URL, CallLedger, error_detail, is_timeout, parse_json_object,
-    request_size_bytes, require_trusted_client,
+    OPENAI_BASE_URL, CallLedger, client_matches, error_detail, is_timeout, offline_call,
+    parse_json_object, request_size_bytes, require_trusted_client,
 )
 from .schemas import ModelCallRecord
 
 
-TRANSPORT_VERSION = "openai-jev-transport-v2"
+TRANSPORT_VERSION = "openai-jev-transport-v3"
 INSTRUCTIONS = (
     "You are Jev, the typed judge in a shadow-only research pipeline. The input is one JSON "
     "object with a pre-cutoff research state and five fixed questions with criteria. Answer "
@@ -43,8 +43,22 @@ class OpenAIJevTransport:
     def drain_call_records(self) -> tuple[ModelCallRecord, ...]:
         return self._ledger.drain()
 
+    def _client_still_trusted(self) -> bool:
+        """Client, binding and version may be reassigned after construction; re-check before every call."""
+        test_client = self._ledger.test_client
+        try:
+            require_registered_identity(self.binding, "JEV")
+        except (TypeError, ValueError):
+            return False
+        return (self._ledger.binding is self.binding
+                and self.transport_version == TRANSPORT_VERSION + ("-test-client" if test_client is True else "")
+                and client_matches(self._client, expected_base_url=OPENAI_BASE_URL, test_client=test_client))
+
     def __call__(self, state: Mapping[str, Any], questions: Mapping[str, Any]) -> Mapping[str, Any]:
         binding, ledger = self.binding, self._ledger
+        if not OpenAIJevTransport._client_still_trusted(self):  # class function: an instance override is ignored
+            ledger.record("JEV", "CLIENT_UNTRUSTED")
+            raise ModelUnavailable("Jev client no longer matches its trust level")
         payload = canonical_json({"state": state, "questions": questions})
         schema = jev_output_schema()
         size = request_size_bytes(INSTRUCTIONS, payload, schema)
@@ -54,41 +68,55 @@ class OpenAIJevTransport:
         try:
             reservation = ledger.budget.reserve(binding.max_call_cost_usd(size))
         except ModelUnavailable:
-            ledger.record("JEV", "BUDGET_EXCEEDED")
+            ledger.record("JEV", "BUDGET_EXCEEDED", budget_locked=ledger.budget.locked)
             raise
-        try:
-            response = self._client.with_options(
-                timeout=binding.timeout_seconds, max_retries=binding.max_retries,
-            ).responses.create(
-                model=binding.model_id,
-                instructions=INSTRUCTIONS,
-                input=payload,
-                reasoning={"effort": binding.effort},
-                max_output_tokens=binding.max_output_tokens,
-                store=False,
-                text={"format": {"type": "json_schema", "name": "jev_judgments",
-                                 "schema": schema, "strict": True}},
-            )
-        except Exception as exc:
-            timed_out = is_timeout(exc)
-            ledger.record("JEV", "TIMEOUT" if timed_out else "API_ERROR", reservation=reservation,
-                          request_id=getattr(exc, "request_id", None), detail=error_detail(exc))
-            raise (ModelTimeout if timed_out else ModelUnavailable)("Jev provider call failed") from exc
-        except BaseException as exc:
-            ledger.record("JEV", "API_ERROR", reservation=reservation, detail=type(exc).__name__)
-            raise
-        try:
-            return self._interpret(response, reservation)
-        except ModelUnavailable:
-            raise
-        except Exception as exc:
-            if not reservation.settled:
-                ledger.record("JEV", "INVALID_OUTPUT", reservation=reservation, detail="unexpected_response_shape")
-            raise ModelUnavailable("Jev INVALID_OUTPUT") from exc
-        except BaseException as exc:
-            if not reservation.settled:
-                ledger.record("JEV", "INVALID_OUTPUT", reservation=reservation, detail=type(exc).__name__)
-            raise
+        with offline_call(ledger.test_client is True) as offline:
+            try:
+                response = self._client.with_options(
+                    timeout=binding.timeout_seconds, max_retries=binding.max_retries,
+                ).responses.create(
+                    model=binding.model_id,
+                    instructions=INSTRUCTIONS,
+                    input=payload,
+                    reasoning={"effort": binding.effort},
+                    max_output_tokens=binding.max_output_tokens,
+                    store=False,
+                    text={"format": {"type": "json_schema", "name": "jev_judgments",
+                                     "schema": schema, "strict": True}},
+                )
+            except Exception as exc:
+                if offline.blocked:
+                    ledger.record("JEV", "CLIENT_UNTRUSTED", reservation=reservation, detail="network_blocked")
+                    raise ModelUnavailable("Jev test client tried to reach the network") from exc
+                timed_out = is_timeout(exc)
+                ledger.record("JEV", "TIMEOUT" if timed_out else "API_ERROR", reservation=reservation,
+                              request_id=getattr(exc, "request_id", None), detail=error_detail(exc))
+                raise (ModelTimeout if timed_out else ModelUnavailable)("Jev provider call failed") from exc
+            except BaseException as exc:
+                ledger.record("JEV", "CLIENT_UNTRUSTED" if offline.blocked else "API_ERROR", reservation=reservation,
+                              detail="network_blocked" if offline.blocked else type(exc).__name__)
+                raise
+            if offline.blocked:
+                ledger.record("JEV", "CLIENT_UNTRUSTED", reservation=reservation, detail="network_blocked")
+                raise ModelUnavailable("Jev test client tried to reach the network")
+            try:
+                data = OpenAIJevTransport._interpret(self, response, reservation)
+            except ModelUnavailable:
+                raise
+            except Exception as exc:
+                if not reservation.settled:
+                    outcome, detail = (("CLIENT_UNTRUSTED", "network_blocked") if offline.blocked
+                                       else ("INVALID_OUTPUT", "unexpected_response_shape"))
+                    ledger.record("JEV", outcome, reservation=reservation, detail=detail)
+                raise ModelUnavailable("Jev INVALID_OUTPUT") from exc
+            except BaseException as exc:
+                if not reservation.settled:
+                    ledger.record("JEV", "INVALID_OUTPUT", reservation=reservation, detail=type(exc).__name__)
+                raise
+            if offline.blocked:  # the stand-in swallowed a blocked attempt while its output was read
+                ledger.record("JEV", "CLIENT_UNTRUSTED", detail="network_blocked")
+                raise ModelUnavailable("Jev test client tried to reach the network")
+            return data
 
     def _interpret(self, response: Any, reservation: Reservation) -> Mapping[str, Any]:
         """Records exactly once, then returns the parsed object or raises ModelUnavailable."""

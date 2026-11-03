@@ -16,7 +16,7 @@ class JevClient:
         binding = require_registered_model("JEV", model_id)
         if getattr(getattr(transport, "binding", None), "role", "JEV") != "JEV":
             raise ValueError("Jev transport is bound to a different role")
-        registered = isinstance(transport, OpenAIJevTransport)
+        registered = type(transport) is OpenAIJevTransport  # exact type: subclasses could relabel
         if network_enabled and not registered:
             raise ValueError("a network-enabled Jev client needs the registered OpenAI transport")
         # Only the registered transport class reports provider and version; other callables are "unspecified".
@@ -29,6 +29,8 @@ class JevClient:
     def judge(self, state: Mapping[str, Any], questions: Mapping[str, Any]) -> Mapping[str, Any]:
         if not self._enabled or self._transport is None:
             raise ModelUnavailable("Jev transport is disabled")
+        if type(self._transport) is not OpenAIJevTransport:  # transport swapped after network was enabled
+            raise ModelUnavailable("Jev transport is no longer the registered transport")
         return self._transport(state, questions)
 
     def drain_call_records(self) -> tuple[Any, ...]:

@@ -24,6 +24,28 @@ from std0_quant.storage import (  # noqa: E402
 STD0_WALLET = "0xdf7930e89a2c47560165331863c31deca0733dcd"
 
 
+@pytest.fixture(autouse=True)
+def _agent_shadow_offline(request, monkeypatch):
+    """Agent-shadow tests must never reach a network, loopback proxies included."""
+    if not request.module.__name__.startswith("test_agent_shadow"):
+        yield
+        return
+    import socket
+
+    # Last-step backstop. Each replacement first raises the audit event the real function would,
+    # so the transports' audit-hook guard still sees (and records) the attempt before this refuses.
+    def refuse(event):
+        def blocked(*args, **_kwargs):
+            sys.audit(event, *args[:2])
+            raise OSError("network access is blocked in agent-shadow tests")
+        return blocked
+
+    monkeypatch.setattr(socket.socket, "connect", refuse("socket.connect"))
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse("socket.connect"))
+    monkeypatch.setattr(socket, "getaddrinfo", refuse("socket.getaddrinfo"))
+    yield
+
+
 @pytest.fixture()
 def project(tmp_path: Path) -> Path:
     """A throwaway project directory with the real frozen settings file."""

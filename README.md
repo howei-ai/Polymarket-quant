@@ -91,6 +91,14 @@ Core properties:
 - deterministic fail-closed classification;
 - temporary-only shadow artifact writing;
 - no order or production-authority capability.
+- model provenance (artifact schema `k3_jev_agent_shadow_v3`): provider labels and per-call records are taken only from the registered `K3Client` / `JevClient` around the registered transports; other model objects are labelled `unspecified` and their self-reported call records are discarded, and inconsistent provenance or a budget overrun blocks the row;
+- offline test stand-ins run under a runtime guard (an audit hook) that, on the calling thread and for the duration of the provider call, refuses new sockets, connections, DNS lookups, thread starts, `subprocess` / `os.system` / `os.exec*` / `os.spawn*` / `posix_spawn` / `fork` and ctypes calls (a first-time import that loads a native library inside the call is refused too).
+
+### Threat model for model provenance and offline stand-ins
+
+Covered (accidental misuse): a test stand-in that is, plainly holds, hides or lazily builds a real SDK client and opens a new connection during its call; a factory-built client swapped into a test transport (or a fake into a real one); swapped bindings or prices (including `ModelBinding` subclasses); instance-level overrides of the registered clients' and transports' methods; a registered client whose transport was replaced; calls that leave no record; forged or relabelled model objects; inconsistent call records; budget overruns. These are refused, recorded as `CLIENT_UNTRUSTED` / `BUDGET_EXCEEDED`, or block the row with `MODEL_PROVENANCE_INVALID` / `BUDGET_OVERRUN`.
+
+Not covered (needs signed artifacts or process isolation): deliberate tampering by code running in the same process (for example rebuilding the registered classes around a genuine client, or editing guard state); network I/O on threads, event loops or connections that existed before the guarded call (for example a stand-in reusing a pooled keep-alive connection of an already-used real client); native code that raises no audit events, including child processes started by `multiprocessing`'s default spawn method on macOS; monkeypatching methods of a genuine factory-built client (the test suite uses this as a seam, and such records are labelled as real calls). Shadow artifacts are therefore research evidence of what the in-process code recorded, not tamper-proof attestations.
 
 ### Deterministic authority
 

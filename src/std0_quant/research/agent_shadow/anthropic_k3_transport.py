@@ -14,13 +14,13 @@ from .interfaces import ModelTimeout, ModelUnavailable
 from .model_registry import CostBudget, ModelBinding, Reservation, binding_for, require_registered_identity
 from .output_schemas import k3_output_schema
 from .provider_common import (
-    ANTHROPIC_BASE_URL, CallLedger, error_detail, is_timeout, parse_json_object,
-    request_size_bytes, require_trusted_client,
+    ANTHROPIC_BASE_URL, CallLedger, client_matches, error_detail, is_timeout, offline_call,
+    parse_json_object, request_size_bytes, require_trusted_client,
 )
 from .schemas import K3_ROLES, ModelCallRecord
 
 
-TRANSPORT_VERSION = "anthropic-k3-transport-v2"
+TRANSPORT_VERSION = "anthropic-k3-transport-v3"
 SYSTEM_PROMPT = (
     "You are K3, the research reasoner in a shadow-only research pipeline. "
     "The user message is one JSON request: follow its instruction for its role, using only "
@@ -32,17 +32,20 @@ SYSTEM_PROMPT = (
 _TRUNCATION_STOPS = ("max_tokens", "model_context_window_exceeded")
 
 
-def _input_tokens(usage: Any) -> Any:
-    """Billing-weighted input tokens: uncached input, cache reads at 1x (billed lower),
-    and cache writes at 2x (the highest cache-write multiplier). Conservative by design."""
+def _input_tokens(usage: Any) -> tuple[Any, Any]:
+    """(raw, billable) input tokens. Raw is uncached input plus cache reads and writes, as
+    recorded; billable prices cache reads at 1x (billed lower) and cache writes at 2x (the
+    highest cache-write multiplier), conservative by design."""
     base = getattr(usage, "input_tokens", None)
     if type(base) is not int:
-        return None
+        return None, None
+    raw = billable = base
     for name, weight in (("cache_creation_input_tokens", 2), ("cache_read_input_tokens", 1)):
         extra = getattr(usage, name, None)
         if type(extra) is int and extra > 0:
-            base += weight * extra
-    return base
+            raw += extra
+            billable += weight * extra
+    return raw, billable
 
 
 class AnthropicK3Transport:
@@ -58,11 +61,25 @@ class AnthropicK3Transport:
     def drain_call_records(self) -> tuple[ModelCallRecord, ...]:
         return self._ledger.drain()
 
+    def _client_still_trusted(self) -> bool:
+        """Client, binding and version may be reassigned after construction; re-check before every call."""
+        test_client = self._ledger.test_client
+        try:
+            require_registered_identity(self.binding, "K3")
+        except (TypeError, ValueError):
+            return False
+        return (self._ledger.binding is self.binding
+                and self.transport_version == TRANSPORT_VERSION + ("-test-client" if test_client is True else "")
+                and client_matches(self._client, expected_base_url=ANTHROPIC_BASE_URL, test_client=test_client))
+
     def __call__(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         role = request.get("role") if isinstance(request, Mapping) else None
         if role not in K3_ROLES:
             raise ValueError("K3 request must name a K3 role")
         binding, ledger = self.binding, self._ledger
+        if not AnthropicK3Transport._client_still_trusted(self):  # class function: an instance override is ignored
+            ledger.record(role, "CLIENT_UNTRUSTED")
+            raise ModelUnavailable("K3 client no longer matches its trust level")
         payload = canonical_json(request)
         schema = k3_output_schema(role)
         size = request_size_bytes(SYSTEM_PROMPT, payload, schema)
@@ -72,47 +89,63 @@ class AnthropicK3Transport:
         try:
             reservation = ledger.budget.reserve(binding.max_call_cost_usd(size))
         except ModelUnavailable:
-            ledger.record(role, "BUDGET_EXCEEDED")
+            ledger.record(role, "BUDGET_EXCEEDED", budget_locked=ledger.budget.locked)
             raise
-        try:
-            response = self._client.with_options(
-                timeout=binding.timeout_seconds, max_retries=binding.max_retries,
-            ).messages.create(
-                model=binding.model_id,
-                max_tokens=binding.max_output_tokens,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": payload}],
-                output_config={"effort": binding.effort, "format": {"type": "json_schema", "schema": schema}},
-            )
-        except Exception as exc:
-            timed_out = is_timeout(exc)
-            ledger.record(role, "TIMEOUT" if timed_out else "API_ERROR", reservation=reservation,
-                          request_id=getattr(exc, "request_id", None), detail=error_detail(exc))
-            raise (ModelTimeout if timed_out else ModelUnavailable)("K3 provider call failed") from exc
-        except BaseException as exc:
-            ledger.record(role, "API_ERROR", reservation=reservation, detail=type(exc).__name__)
-            raise
-        try:
-            return self._interpret(role, response, reservation)
-        except ModelUnavailable:
-            raise
-        except Exception as exc:
-            if not reservation.settled:
-                ledger.record(role, "INVALID_OUTPUT", reservation=reservation, detail="unexpected_response_shape")
-            raise ModelUnavailable("K3 INVALID_OUTPUT") from exc
-        except BaseException as exc:
-            if not reservation.settled:
-                ledger.record(role, "INVALID_OUTPUT", reservation=reservation, detail=type(exc).__name__)
-            raise
+        with offline_call(ledger.test_client is True) as offline:
+            try:
+                response = self._client.with_options(
+                    timeout=binding.timeout_seconds, max_retries=binding.max_retries,
+                ).messages.create(
+                    model=binding.model_id,
+                    max_tokens=binding.max_output_tokens,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": payload}],
+                    output_config={"effort": binding.effort, "format": {"type": "json_schema", "schema": schema}},
+                )
+            except Exception as exc:
+                if offline.blocked:
+                    ledger.record(role, "CLIENT_UNTRUSTED", reservation=reservation, detail="network_blocked")
+                    raise ModelUnavailable("K3 test client tried to reach the network") from exc
+                timed_out = is_timeout(exc)
+                ledger.record(role, "TIMEOUT" if timed_out else "API_ERROR", reservation=reservation,
+                              request_id=getattr(exc, "request_id", None), detail=error_detail(exc))
+                raise (ModelTimeout if timed_out else ModelUnavailable)("K3 provider call failed") from exc
+            except BaseException as exc:
+                ledger.record(role, "CLIENT_UNTRUSTED" if offline.blocked else "API_ERROR", reservation=reservation,
+                              detail="network_blocked" if offline.blocked else type(exc).__name__)
+                raise
+            if offline.blocked:
+                ledger.record(role, "CLIENT_UNTRUSTED", reservation=reservation, detail="network_blocked")
+                raise ModelUnavailable("K3 test client tried to reach the network")
+            try:
+                data = AnthropicK3Transport._interpret(self, role, response, reservation)
+            except ModelUnavailable:
+                raise
+            except Exception as exc:
+                if not reservation.settled:
+                    outcome, detail = (("CLIENT_UNTRUSTED", "network_blocked") if offline.blocked
+                                       else ("INVALID_OUTPUT", "unexpected_response_shape"))
+                    ledger.record(role, outcome, reservation=reservation, detail=detail)
+                raise ModelUnavailable("K3 INVALID_OUTPUT") from exc
+            except BaseException as exc:
+                if not reservation.settled:
+                    ledger.record(role, "INVALID_OUTPUT", reservation=reservation, detail=type(exc).__name__)
+                raise
+            if offline.blocked:  # the stand-in swallowed a blocked attempt while its output was read
+                ledger.record(role, "CLIENT_UNTRUSTED", detail="network_blocked")
+                raise ModelUnavailable("K3 test client tried to reach the network")
+            return data
 
     def _interpret(self, role: str, response: Any, reservation: Reservation) -> Mapping[str, Any]:
         """Records exactly once, then returns the parsed object or raises ModelUnavailable."""
         binding, ledger = self.binding, self._ledger
         usage = getattr(response, "usage", None)
         served = getattr(response, "model", None)
+        raw_input, billable_input = _input_tokens(usage)
         meta = {
             "reservation": reservation, "served": served, "request_id": getattr(response, "_request_id", None),
-            "input_tokens": _input_tokens(usage), "output_tokens": getattr(usage, "output_tokens", None),
+            "input_tokens": raw_input, "billable_input_tokens": billable_input,
+            "output_tokens": getattr(usage, "output_tokens", None),
         }
 
         def fail(outcome: str, detail: Any = None) -> ModelUnavailable:
