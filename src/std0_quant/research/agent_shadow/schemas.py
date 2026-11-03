@@ -12,10 +12,16 @@ from .audit import sha256_json
 ANALYST_ROLES = ("MICROSTRUCTURE", "MOMENTUM", "LIQUIDITY", "REGIME")
 DEBATE_ROLES = ("BULL_RESEARCHER", "BEAR_RESEARCHER")
 K3_ROLES = ANALYST_ROLES + DEBATE_ROLES + ("RESEARCH_MANAGER",)
+# Must match model_registry.ROUTES (names and their provenance labels).
+ROUTE_PROVENANCE = {"official": "OFFICIAL", "relay_mtu": "UNVERIFIED_RELAY"}
+ROUTE_NAMES = tuple(ROUTE_PROVENANCE)
+# OFFICIAL: registered models, real clients, official route. UNVERIFIED_RELAY: same via the relay.
+# TEST_CLIENT: registered transports around offline stand-ins. UNSPECIFIED: anything else.
+ARTIFACT_PROVENANCES = ("OFFICIAL", "UNVERIFIED_RELAY", "TEST_CLIENT", "UNSPECIFIED")
 COMPARISON_ARMS = ("BASELINE", "K3_ONLY", "K3_PLUS_JEV")
 CALL_OUTCOMES = ("OK", "REFUSAL", "TRUNCATED", "UNEXPECTED_STOP", "SERVED_MODEL_MISMATCH",
                  "INVALID_OUTPUT", "API_ERROR", "TIMEOUT", "BUDGET_EXCEEDED", "INPUT_TOO_LARGE",
-                 "CLIENT_UNTRUSTED")
+                 "CLIENT_UNTRUSTED", "RELAY_NOT_ALLOWED", "ROUTE_MIXED")
 
 
 def _mapping(raw: Any, keys: set[str], name: str) -> Mapping[str, Any]:
@@ -150,6 +156,7 @@ class ModelCallRecord:
     cost_usd: float | None
     cost_is_upper_bound: bool
     test_client: bool
+    route: str  # provider route the call was sent through (model_registry.ROUTES)
     billable_input_tokens: int | None = None  # priced input count; >= input_tokens (cache writes weigh more)
     budget_overrun: bool = False  # charge exceeded its reservation, or refused because the budget locked
 
@@ -181,6 +188,8 @@ class ModelCallRecord:
             raise ValueError("test_client must be boolean")
         if type(self.budget_overrun) is not bool:
             raise ValueError("budget_overrun must be boolean")
+        if self.route not in ROUTE_NAMES:
+            raise ValueError("unknown model call route")
 
 
 @dataclass(frozen=True)
@@ -204,6 +213,8 @@ class ShadowResult:
     jev_provider: str
     jev_transport_version: str
     model_calls: tuple[ModelCallRecord, ...]
+    route: str
+    provenance: str
     analyst_reports: tuple[AnalystReport, ...]
     bull_report: AnalystReport | None
     bear_report: AnalystReport | None
@@ -229,6 +240,17 @@ class ShadowResult:
         for name in ("k3_provider", "k3_transport_version", "jev_provider", "jev_transport_version"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
                 raise ValueError(f"{name} required")
+        if self.route not in ROUTE_NAMES + ("unspecified",):
+            raise ValueError("unknown artifact route")
+        if self.provenance not in ARTIFACT_PROVENANCES:
+            raise ValueError("unknown artifact provenance")
+        if self.route == "unspecified":
+            if self.provenance != "UNSPECIFIED":
+                raise ValueError("an artifact without a single route must be UNSPECIFIED")
+        elif self.provenance not in (ROUTE_PROVENANCE[self.route], "TEST_CLIENT") or any(
+            getattr(call, "route", None) != self.route for call in self.model_calls
+        ):
+            raise ValueError("artifact provenance and call routes must match the artifact route")
         if not isinstance(self.model_calls, tuple) or any(
             not isinstance(call, ModelCallRecord) for call in self.model_calls
         ):

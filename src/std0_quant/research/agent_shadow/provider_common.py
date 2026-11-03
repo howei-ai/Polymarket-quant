@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import sys
 import threading
@@ -12,26 +13,40 @@ from types import SimpleNamespace
 from typing import Any, Iterator
 
 from .audit import canonical_json
-from .model_registry import CostBudget, ModelBinding, Reservation
+from .interfaces import ModelUnavailable
+from .model_registry import ROUTES, CostBudget, ModelBinding, Reservation, route_for
 from .schemas import ModelCallRecord
 
 
-ANTHROPIC_BASE_URL = "https://api.anthropic.com"
-OPENAI_BASE_URL = "https://api.openai.com/v1"
+ANTHROPIC_BASE_URL = ROUTES["official"].base_urls["anthropic"]
+OPENAI_BASE_URL = ROUTES["official"].base_urls["openai"]
 # Bytes added to every request's size estimate for message framing and SDK overhead.
 REQUEST_OVERHEAD_BYTES = 2_048
 
-_TRUSTED_CLIENTS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+# id(client) -> (weak reference, route name); looked up by identity, never by the client's __hash__/__eq__.
+_TRUSTED_CLIENTS: dict[int, tuple["weakref.ref[Any]", str]] = {}
+
+
+def _trusted_route(client: Any) -> str | None:
+    """Route a factory-built client was registered for, by identity; None for anything else."""
+    entry = _TRUSTED_CLIENTS.get(id(client))
+    return entry[1] if entry is not None and entry[0]() is client else None
 
 
 def _is_trusted(client: Any) -> bool:
-    """Identity membership: never runs the candidate's own __hash__ or __eq__."""
-    return any(trusted is client for trusted in list(_TRUSTED_CLIENTS))
+    return _trusted_route(client) is not None
 
 
-def register_trusted_client(client: Any) -> Any:
-    """Called only by provider_clients factories (pinned base URL, trust_env off)."""
-    _TRUSTED_CLIENTS.add(client)
+def register_trusted_client(client: Any, route: str = "official") -> Any:
+    """Called only by provider_clients factories (route-pinned base URL, trust_env off)."""
+    route_for(route)
+    key = id(client)
+
+    def forget(ref: Any, key: int = key) -> None:
+        if _TRUSTED_CLIENTS.get(key, (None,))[0] is ref:  # ids can be reused; drop only this entry
+            del _TRUSTED_CLIENTS[key]
+
+    _TRUSTED_CLIENTS[key] = (weakref.ref(client, forget), route)
     return client
 
 
@@ -162,7 +177,8 @@ def _stand_in_acceptable(client: Any) -> bool:
     return acceptable and not state.blocked
 
 
-def require_trusted_client(client: Any, *, expected_base_url: str, allow_test_client: bool) -> bool:
+def require_trusted_client(client: Any, *, expected_base_url: str, allow_test_client: bool,
+                           route: str = "official") -> bool:
     """Returns True when an offline test stand-in is accepted (recorded in the transport version).
 
     Real SDK clients are accepted only when built by provider_clients, even in tests. A stand-in
@@ -172,7 +188,7 @@ def require_trusted_client(client: Any, *, expected_base_url: str, allow_test_cl
     """
     if type(allow_test_client) is not bool:
         raise TypeError("allow_test_client must be an explicit boolean")
-    if _is_trusted(client) and str(client.base_url).rstrip("/") == expected_base_url:
+    if _trusted_route(client) == route and str(client.base_url).rstrip("/") == expected_base_url:
         return False
     if allow_test_client:
         if not _stand_in_acceptable(client):
@@ -181,13 +197,83 @@ def require_trusted_client(client: Any, *, expected_base_url: str, allow_test_cl
     raise ValueError("provider client must come from provider_clients with the pinned base URL")
 
 
-def client_matches(client: Any, *, expected_base_url: str, test_client: bool) -> bool:
+def client_matches(client: Any, *, expected_base_url: str, test_client: bool, route: str = "official") -> bool:
     """Re-check, after construction, that a transport's client still has the trust level its
     version and records claim: a factory-built client on the pinned base URL for real runs, or
     an acceptable stand-in (checked inside the offline guard) for test runs."""
     if test_client is True:
         return _stand_in_acceptable(client)
-    return test_client is False and _is_trusted(client) and str(client.base_url).rstrip("/") == expected_base_url
+    return (test_client is False and _trusted_route(client) == route
+            and str(client.base_url).rstrip("/") == expected_base_url)
+
+
+class RoutePolicy:
+    """Route rules for the provider calls made in one scope (for ShadowRunner: one row)."""
+
+    __slots__ = ("route", "allow_unverified_relay", "conflict", "parent")
+
+    def __init__(self, route: str | None, allow_unverified_relay: bool, parent: "RoutePolicy | None") -> None:
+        self.route = route  # None: pinned by the first call in the scope
+        self.allow_unverified_relay = allow_unverified_relay
+        self.conflict = False  # the scope asked for a different route than an enclosing scope pins
+        self.parent = parent
+
+    def pin(self, route: str) -> None:
+        """Pins this scope and every unpinned enclosing scope to route."""
+        policy: RoutePolicy | None = self
+        while policy is not None:
+            if policy.route is None:
+                policy.route = route
+            policy = policy.parent
+
+
+_ROUTE_POLICY: contextvars.ContextVar[RoutePolicy | None] = contextvars.ContextVar(
+    "agent_shadow_route_policy", default=None)
+
+
+@contextlib.contextmanager
+def route_policy(route: str | None = None, *, allow_unverified_relay: bool = False) -> Iterator[RoutePolicy]:
+    """Scope in which provider calls may run. Transports check it on every call on the calling
+    thread (context variables do not reach threads started inside the scope), so however a
+    transport is wrapped: a relay call needs allow_unverified_relay=True, and every call in the
+    scope must use one route (the given one, or the first one used). A nested scope can only
+    narrow its enclosing scope: it needs the enclosing opt-in too, and shares its route."""
+    if route is not None:
+        route = route_for(route).name
+    if type(allow_unverified_relay) is not bool:
+        raise TypeError("allow_unverified_relay must be an explicit boolean")
+    parent = _ROUTE_POLICY.get()
+    if parent is not None:
+        allow_unverified_relay = allow_unverified_relay and parent.allow_unverified_relay
+    policy = RoutePolicy(route, allow_unverified_relay, parent)
+    if parent is not None and parent.route is not None:
+        policy.conflict = route is not None and route != parent.route
+        policy.route = parent.route
+    elif route is not None:
+        policy.pin(route)
+    token = _ROUTE_POLICY.set(policy)
+    try:
+        yield policy
+    finally:
+        _ROUTE_POLICY.reset(token)
+
+
+def route_refusal(route: str) -> str | None:
+    """Call outcome the current route policy imposes on a call through `route`, or None.
+    Outside any scope, official calls are allowed and relay calls are refused."""
+    policy = _ROUTE_POLICY.get()
+    if route_for(route).provenance != "OFFICIAL" and not (policy is not None and policy.allow_unverified_relay):
+        return "RELAY_NOT_ALLOWED"
+    if policy is not None:
+        if policy.conflict or (policy.route is not None and policy.route != route):
+            return "ROUTE_MIXED"
+        policy.pin(route)
+    return None
+
+
+def transport_version_for(base_version: str, route: str, test_client: bool) -> str:
+    """The only version a transport may report: base, route suffix, then the test-client marker."""
+    return base_version + route_for(route).version_suffix + ("-test-client" if test_client is True else "")
 
 
 def request_size_bytes(*parts: Any) -> int:
@@ -242,12 +328,14 @@ class CallLedger:
     Not thread-safe: use one transport (and runner) per thread; CostBudget may be shared.
     """
 
-    def __init__(self, binding: ModelBinding, budget: CostBudget, *, test_client: bool = False) -> None:
+    def __init__(self, binding: ModelBinding, budget: CostBudget, *, test_client: bool = False,
+                 route: str = "official") -> None:
         if not isinstance(budget, CostBudget):
             raise TypeError("an explicit CostBudget is required")
         self.binding = binding
         self.budget = budget
         self.test_client = test_client
+        self.route = route_for(route).name
         self._records: list[ModelCallRecord] = []
 
     def record(self, role: str, outcome: str, *, reservation: Reservation | None = None, served: Any = None,
@@ -260,6 +348,8 @@ class CallLedger:
         reservation is charged, because a failed or timed-out request may still have been billed.
         A charge above the reservation locks the budget; that record, and any refusal because the
         budget is locked (budget_locked=True), carries budget_overrun=True."""
+        if self.route not in ROUTES:
+            raise ModelUnavailable("call ledger route is no longer a registered route")
         in_tokens, out_tokens = token_count(input_tokens), token_count(output_tokens)
         billable = in_tokens if billable_input_tokens is None else token_count(billable_input_tokens)
         cost, upper_bound, overrun = None, False, budget_locked is True
@@ -275,7 +365,7 @@ class CallLedger:
             detail=short_text(detail), input_tokens=in_tokens, output_tokens=out_tokens,
             cost_usd=cost, cost_is_upper_bound=upper_bound, test_client=self.test_client,
             billable_input_tokens=billable if in_tokens is not None and billable is not None else None,
-            budget_overrun=overrun,
+            budget_overrun=overrun, route=self.route,
         ))
 
     def drain(self) -> tuple[ModelCallRecord, ...]:

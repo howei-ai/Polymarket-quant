@@ -91,14 +91,15 @@ src/std0_quant/research/agent_shadow/
 - 确定性 fail-closed classification；
 - 仅允许写入临时 shadow artifact；
 - 不具备订单或生产权限。
-- 模型来源校验（产物 schema `k3_jev_agent_shadow_v3`）：供应商标签和逐次调用记录只取自注册的 `K3Client` / `JevClient` 及其注册 transport；其他模型对象标为 `unspecified`，其自报的调用记录会被丢弃；来源不一致或预算超支时该行判为 BLOCKED；
+- 供应商通道：`official`（Anthropic / OpenAI 官方 API）与 `relay_mtu`（第三方中转站 `https://mtu.mtuopenai.xyz`，密钥 `STD0_RELAY_API_KEY`）。每条通道的地址和密钥变量都写死在代码里；只要传入的环境或进程环境中存在官方凭证（`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`OPENAI_ADMIN_KEY`、`OPENAI_WEBHOOK_SECRET`、`ANTHROPIC_AUTH_TOKEN`），就拒绝构建中转客户端。transport 在每次调用时执行通道策略：中转调用必须处于显式开启的范围内（`ShadowRunner(..., allow_unverified_relay=True)` 或 `route_policy(allow_unverified_relay=True)`），否则被拒绝；同一行的所有调用必须使用同一条通道，无论模型外面包了几层（在发起调用的线程上检查；嵌套的 `route_policy` 作用域只能收紧外层）。`ShadowRunner` 还会在任何调用之前拦截：注册模型走中转却未开启（`RELAY_NOT_ALLOWED`）、两边通道不同或中转模型旁边是未注册模型（`MODEL_ROUTE_MIXED`）、测试替身与真实客户端混用（`TEST_CLIENT_MIXED`）。产物带 `route` 与 `provenance`（`OFFICIAL`、`UNVERIFIED_RELAY`、仅当两边都是替身时才为 `TEST_CLIENT`、`UNSPECIFIED`），schema 会校验它们与调用记录的通道一致；
+- 模型来源校验（产物 schema `k3_jev_agent_shadow_v4`）：供应商标签和逐次调用记录只取自注册的 `K3Client` / `JevClient` 及其注册 transport；其他模型对象标为 `unspecified`，其自报的调用记录会被丢弃；来源不一致或预算超支时该行判为 BLOCKED；
 - 离线测试替身在调用期间受运行时防线（审计钩子）约束：仅针对发起调用的线程、仅在调用期间，拒绝新建 socket、建立连接、DNS 解析、启动线程、`subprocess` / `os.system` / `os.exec*` / `os.spawn*` / `posix_spawn` / `fork` 以及 ctypes 调用（调用期间首次导入并加载原生库也会被拒绝）。
 
 ### 模型来源与离线替身的威胁边界
 
 覆盖（误用）：测试替身本身是、明显持有、隐藏或在调用时临时创建真实 SDK 客户端，并在调用期间新建连接；把工厂创建的真实客户端换进测试 transport（或把假客户端换进正式 transport）；替换绑定或价格（包括 `ModelBinding` 子类）；在实例上覆盖注册客户端或 transport 的方法；注册客户端的 transport 被替换；调用没有留下记录；伪造或改标签的模型对象；不一致的调用记录；预算超支。这些情况会被拒绝、记录为 `CLIENT_UNTRUSTED` / `BUDGET_EXCEEDED`，或令该行以 `MODEL_PROVENANCE_INVALID` / `BUDGET_OVERRUN` 判为 BLOCKED。
 
-不覆盖（需要签名产物或进程隔离）：同一进程内代码的故意篡改（例如围绕真实客户端重建注册类、修改防线状态）；在受保护调用开始前就已存在的线程、事件循环或连接上的网络 I/O（例如替身复用一个已用过的真实客户端连接池里的 keep-alive 连接）；不触发审计事件的原生代码，包括 macOS 上 `multiprocessing` 默认 spawn 方式启动的子进程；对工厂创建的真实客户端的方法做 monkeypatch（测试套件把它当作测试接缝，这类记录会被标为真实调用）。因此 Shadow 产物是进程内代码所记录内容的研究证据，而不是防篡改的证明。
+不覆盖（需要签名产物或进程隔离）：同一进程内代码的故意篡改（例如围绕真实客户端重建注册类、修改防线状态）；在受保护调用开始前就已存在的线程、事件循环或连接上的网络 I/O（例如替身复用一个已用过的真实客户端连接池里的 keep-alive 连接）；不触发审计事件的原生代码，包括 macOS 上 `multiprocessing` 默认 spawn 方式启动的子进程；在通道策略作用域内新启动的线程里发起的官方调用（上下文变量不会传入这些线程，因此不会按该行的通道核对；其中的中转调用仍会被拒绝）；对工厂创建的真实客户端的方法做 monkeypatch（测试套件把它当作测试接缝，这类记录会被标为真实调用）。中转通道不在上述任何核验范围内：中转站能看到每个请求的全部内容，其后端模型、计费和数据处理都无法核实（只核对返回的模型名和输出 schema，且拿不到 request id）。注册中转模型产出的行标记为 `UNVERIFIED_RELAY`（涉及未注册或被包装模型的行为 `UNSPECIFIED`），必须与官方结果分开；在另行授权真实研究数据之前，只允许经中转站发送合成数据。总之，Shadow 产物是进程内代码所记录内容的研究证据，而不是防篡改的证明。
 
 ### 确定性权威
 

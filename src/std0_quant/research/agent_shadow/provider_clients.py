@@ -1,8 +1,9 @@
 """Explicit SDK client construction and registered K3/Jev wiring.
 
 Credentials come only from the environment and are never logged or echoed.
-Routing is explicit: base URLs are pinned (ANTHROPIC_BASE_URL / OPENAI_BASE_URL are
-ignored) and each client gets its own transport, so neither environment nor macOS
+Routing is explicit: base URLs and key variables are pinned per registered route ("official",
+or the "relay_mtu" relay whose artifacts are UNVERIFIED_RELAY; ANTHROPIC_BASE_URL / OPENAI_BASE_URL
+are ignored) and each client gets its own transport, so neither environment nor macOS
 system proxies apply; pass proxy_url to use a proxy. Anthropic tracing and trace-header
 propagation are off. Environment variables that log request bodies, inject headers, or
 re-target OpenAI billing are refused. Constructing a client sends no request; network
@@ -20,9 +21,12 @@ from .anthropic_k3_transport import AnthropicK3Transport
 from .interfaces import ModelUnavailable
 from .jev_client import JevClient
 from .k3_client import K3Client
-from .model_registry import CostBudget, binding_for
+from .model_registry import OFFICIAL_KEY_ENV, CostBudget, binding_for, route_for
+
+# Official credentials a relay client must never see, including ones the SDKs pick up by themselves.
+OFFICIAL_CREDENTIAL_ENV = OFFICIAL_KEY_ENV + ("OPENAI_ADMIN_KEY", "OPENAI_WEBHOOK_SECRET", "ANTHROPIC_AUTH_TOKEN")
 from .openai_jev_transport import OpenAIJevTransport
-from .provider_common import ANTHROPIC_BASE_URL, OPENAI_BASE_URL, register_trusted_client
+from .provider_common import register_trusted_client
 
 
 REFUSED_ENVIRONMENT = ("ANTHROPIC_LOG", "OPENAI_LOG", "ANTHROPIC_CUSTOM_HEADERS", "OPENAI_CUSTOM_HEADERS",
@@ -79,33 +83,52 @@ def _http_client(sdk_http_client: Any, proxy_url: str | None) -> Any:
     return sdk_http_client(trust_env=False, transport=transport)
 
 
-def build_anthropic_client(*, environ: Mapping[str, str] | None = None, proxy_url: str | None = None) -> Any:
-    key = _api_key(environ, "ANTHROPIC_API_KEY")
+def _route_key(environ: Mapping[str, str] | None, route: str, provider: str) -> tuple[str, str]:
+    """(api key, base URL) for a route. A relay route refuses to build while an official key is
+    present, so a mixed-up environment cannot send official credentials or traffic to a relay."""
+    selected = route_for(route)
+    if selected.provenance != "OFFICIAL":
+        # Both the given mapping and the process environment: the SDKs read official credentials
+        # (OPENAI_ADMIN_KEY, webhook secrets) from os.environ on their own.
+        sources = (os.environ,) if environ is None else (environ, os.environ)
+        present = sorted({name for env in sources for name in OFFICIAL_CREDENTIAL_ENV if name in env})
+        if present:
+            raise ModelUnavailable(f"refusing to build a {route} client while {present} is set")
+    return _api_key(environ, selected.key_env[provider]), selected.base_urls[provider]
+
+
+def build_anthropic_client(*, environ: Mapping[str, str] | None = None, proxy_url: str | None = None,
+                           route: str = "official") -> Any:
+    key, base_url = _route_key(environ, route, "anthropic")
     import anthropic
 
     http_client = _http_client(anthropic.DefaultHttpxClient, proxy_url)
     return register_trusted_client(anthropic.Anthropic(
-        api_key=key, base_url=ANTHROPIC_BASE_URL, http_client=http_client,
+        api_key=key, base_url=base_url, http_client=http_client,
         open_telemetry={"traces": False, "propagation": False},
-    ))
+    ), route)
 
 
 def build_openai_client(*, environ: Mapping[str, str] | None = None, proxy_url: str | None = None,
-                        organization: str | None = None, project: str | None = None) -> Any:
-    key = _api_key(environ, "OPENAI_API_KEY")
+                        organization: str | None = None, project: str | None = None,
+                        route: str = "official") -> Any:
+    key, base_url = _route_key(environ, route, "openai")
     organization = _optional_text(organization, "organization")
     project = _optional_text(project, "project")
+    if route_for(route).provenance != "OFFICIAL" and (organization is not None or project is not None):
+        raise ValueError("organization and project apply only to the official OpenAI route")
     import openai
 
     http_client = _http_client(openai.DefaultHttpx2Client, proxy_url)
     return register_trusted_client(openai.OpenAI(
-        api_key=key, base_url=OPENAI_BASE_URL, organization=organization, project=project,
+        api_key=key, base_url=base_url, organization=organization, project=project,
         http_client=http_client,
-    ))
+    ), route)
 
 
 def build_shadow_models(anthropic_client: Any, openai_client: Any, *, budget: CostBudget,
-                        network_enabled: bool, allow_test_clients: bool = False) -> tuple[K3Client, JevClient]:
+                        network_enabled: bool, allow_test_clients: bool = False,
+                        route: str = "official") -> tuple[K3Client, JevClient]:
     """K3 on the registered Anthropic model, Jev on the registered OpenAI model, one shared budget.
 
     allow_test_clients=True accepts offline stand-ins (never unregistered real SDK clients);
@@ -113,9 +136,11 @@ def build_shadow_models(anthropic_client: Any, openai_client: Any, *, budget: Co
     """
     if type(network_enabled) is not bool:
         raise TypeError("network_enabled must be an explicit boolean")
-    k3 = K3Client(AnthropicK3Transport(anthropic_client, budget=budget, allow_test_client=allow_test_clients),
+    k3 = K3Client(AnthropicK3Transport(anthropic_client, budget=budget, allow_test_client=allow_test_clients,
+                                       route=route),
                   network_enabled=network_enabled)
     jev = JevClient(model_id=binding_for("JEV").model_id,
-                    transport=OpenAIJevTransport(openai_client, budget=budget, allow_test_client=allow_test_clients),
+                    transport=OpenAIJevTransport(openai_client, budget=budget, allow_test_client=allow_test_clients,
+                                                 route=route),
                     network_enabled=network_enabled)
     return k3, jev
