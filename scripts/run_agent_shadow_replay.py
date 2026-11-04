@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay frozen pretrade feature rows through the K3/Jev agent shadow (SHADOW only).
 
-  --plan-only   verify the pinned inputs and print row, drop and evidence counts; no model calls.
+  --plan-only   verify pinned inputs; optionally inspect --out-dir and plan a bounded resume.
   otherwise     attempt up to --max-rows rows within --budget-usd and append SHADOW artifacts
                 to --out-dir (outside this repository, the inputs and data/), resuming past rows
                 that already have a final attempt.
@@ -34,8 +34,10 @@ from std0_quant.config import load_settings, resolve_path  # noqa: E402
 from std0_quant.research.agent_shadow import provider_clients  # noqa: E402
 from std0_quant.research.agent_shadow.model_registry import ROUTES, CostBudget, binding_for  # noqa: E402
 from std0_quant.research.agent_shadow.replay import (  # noqa: E402
-    REPLAY_VERSION, ReplayWriter, build_replay_plan, load_frozen_inputs, replay_run_binding, run_replay,
+    DEFAULT_MAX_ATTEMPTS, DEFAULT_ROW_HEADROOM_USD, REPLAY_VERSION, ReplayWriter,
+    build_replay_plan, load_frozen_inputs, replay_run_binding, run_replay,
 )
+from std0_quant.research.agent_shadow.replay_planning import plan_replay_run  # noqa: E402
 from std0_quant.research.agent_shadow.runner import ShadowRunner  # noqa: E402
 
 
@@ -60,11 +62,11 @@ def _proxy_label(proxy_url: str | None) -> str | None:
     return f"{parts.scheme}://{parts.hostname}" + (f":{parts.port}" if parts.port else "")
 
 
-def _forbidden_roots(input_dir: Path) -> tuple[Path, ...]:
+def _forbidden_roots(input_dir: Path, *, load_env_file: bool = True) -> tuple[Path, ...]:
     """The repository, the inputs and every configured data path (any may be absolute)."""
     roots = [ROOT, input_dir]
     try:
-        settings = load_settings(project_root=ROOT)
+        settings = load_settings(project_root=ROOT, load_env_file=load_env_file)
         roots.extend(resolve_path(settings, name) for name in type(settings.paths).model_fields)
     except Exception as exc:  # settings unreadable: refuse to guess where data/ is
         raise SystemExit(f"cannot resolve the configured data paths: {type(exc).__name__}") from None
@@ -79,6 +81,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--budget-usd", type=float)
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+                        help="non-final attempt cap per row, including previous runs (default: 3)")
+    parser.add_argument("--row-headroom-usd", type=float, default=DEFAULT_ROW_HEADROOM_USD,
+                        help="minimum new-run budget remaining to start a row (default: 1.5)")
     parser.add_argument("--route", choices=sorted(ROUTES), default="official")
     parser.add_argument("--allow-unverified-relay", action="store_true")
     parser.add_argument("--proxy-url")
@@ -99,10 +105,22 @@ def _check_run_arguments(args: argparse.Namespace) -> None:
     _proxy_label(args.proxy_url)
 
 
+def _check_planning_limits(args: argparse.Namespace) -> None:
+    if args.max_rows is not None and args.max_rows < 1:
+        raise SystemExit("--max-rows must be at least 1")
+    if args.budget_usd is not None and (not math.isfinite(args.budget_usd) or args.budget_usd <= 0):
+        raise SystemExit("--budget-usd must be a finite positive amount")
+    if args.max_attempts < 1:
+        raise SystemExit("--max-attempts must be at least 1")
+    if not math.isfinite(args.row_headroom_usd) or args.row_headroom_usd < 0:
+        raise SystemExit("--row-headroom-usd must be finite and nonnegative")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if not args.plan_only:
         _check_run_arguments(args)
+    _check_planning_limits(args)
     inputs = load_frozen_inputs(args.input_dir)
     plan = build_replay_plan(inputs["features"]["records"], inputs["provenance"]["records"],
                              eligible_only=not args.include_ineligible)
@@ -115,6 +133,15 @@ def main(argv: list[str] | None = None) -> int:
         "redaction": "condition_id hashed; timestamps shifted to a synthetic epoch; absolute BTC prices dropped",
     }
     if args.plan_only:
+        try:
+            summary_plan["run_plan"] = plan_replay_run(
+                rows, route=args.route, out_dir=args.out_dir,
+                forbidden_roots=_forbidden_roots(args.input_dir, load_env_file=False) if args.out_dir is not None else (),
+                max_rows=args.max_rows, budget_usd=args.budget_usd,
+                max_attempts=args.max_attempts, row_headroom_usd=args.row_headroom_usd)
+        except (ValueError, TypeError, OSError) as exc:
+            print(f"offline run plan unavailable: {type(exc).__name__}", file=sys.stderr)
+            return 2
         print(json.dumps(summary_plan, indent=2, sort_keys=True))
         return 0
     writer = ReplayWriter(args.out_dir, forbidden_roots=_forbidden_roots(args.input_dir))
@@ -130,13 +157,16 @@ def main(argv: list[str] | None = None) -> int:
             **summary_plan, "code_head": _git_head(), "route": args.route, "provenance": ROUTES[args.route].provenance,
             "models": {role: {"provider": binding_for(role).provider, "model_id": binding_for(role).model_id,
                               "effort": binding_for(role).effort} for role in ("K3", "JEV")},
-            "max_rows": args.max_rows, "budget_usd": args.budget_usd, "proxy": _proxy_label(args.proxy_url),
+            "max_rows": args.max_rows, "budget_usd": args.budget_usd,
+            "max_attempts": args.max_attempts, "row_headroom_usd": args.row_headroom_usd,
+            "proxy": _proxy_label(args.proxy_url),
             "inputs": {name: {"file": item["path"].name, "sha256": item["sha256"], "rows": len(item["records"])}
                        for name, item in inputs.items()},
             "execution_allowed": False, "formal_cohort_effect": False,
         }
         writer.write_once("run_manifest", manifest)
-        summary = run_replay(rows, runner, writer, budget, max_rows=args.max_rows)
+        summary = run_replay(rows, runner, writer, budget, max_rows=args.max_rows,
+                             max_attempts=args.max_attempts, row_headroom_usd=args.row_headroom_usd)
         writer.write_once("run_summary", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

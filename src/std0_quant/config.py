@@ -154,9 +154,10 @@ def find_project_root(start: Path | None = None) -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _apply_env_overrides(raw: dict[str, object]) -> dict[str, object]:
+def _apply_env_overrides(raw: dict[str, object], *, load_env_file: bool = True) -> dict[str, object]:
     """Apply supported ``.env`` / environment overrides onto the raw YAML dict."""
-    load_dotenv()
+    if load_env_file:
+        load_dotenv()
     env_map = {
         "STD0_NAME": ("trader", "name"),
         "STD0_WALLET": ("trader", "wallet"),
@@ -199,13 +200,21 @@ def _validate_frozen(settings: Settings) -> None:
 def load_settings(
     config_path: Path | str | None = None,
     project_root: Path | None = None,
+    *,
+    load_env_file: bool = True,
 ) -> Settings:
-    """Load settings from YAML + environment overrides and validate frozen definitions."""
+    """Load YAML and supported environment overrides; validate frozen definitions.
+
+    Read-only callers can skip dotenv files with load_env_file=False. Existing
+    process overrides still apply, and the default dotenv behavior is unchanged.
+    """
+    if type(load_env_file) is not bool:
+        raise TypeError("load_env_file must be a boolean")
     root = find_project_root(Path(project_root) if project_root else None)
     path = Path(config_path) if config_path else root / "config" / "settings.yaml"
     with open(path, "r", encoding="utf-8") as fh:
         raw: dict[str, object] = yaml.safe_load(fh) or {}
-    raw = _apply_env_overrides(raw)
+    raw = _apply_env_overrides(raw, load_env_file=load_env_file)
     settings = Settings.model_validate(raw)
     _validate_frozen(settings)
     settings._project_root = root

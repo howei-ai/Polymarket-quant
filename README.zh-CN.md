@@ -84,6 +84,8 @@ src/std0_quant/research/agent_shadow/
 
 `python scripts/summarize_agent_shadow_replay.py --input-dir /tmp/shadow-replay` 只读 v3 回放目录并向 stdout 输出 JSON 汇总。工具校验 artifact 哈希、schema 和绑定一致性，分别统计所有尝试、每行最后状态及已终结结果；最终接受率以所有已终结行为分母，包含最终 BLOCKED 行，排除未终结及产物中不存在的行。重试费用累计计入，已定价记录（含预留估算）的费用以十进制字符串求和，null 费用保留为未定价记录计数。未终结行可能已耗尽重试次数。输出仅含聚合数据，不含行标识、request id 或模型文本；读取范围为绑定和 artifacts，不调用模型、不写文件。哈希检查表示完整性，不证明原始证据真实性或中转账单。
 
+`python scripts/run_agent_shadow_replay.py --input-dir /tmp/frozen-features --plan-only --out-dir /tmp/shadow-replay --route relay_mtu --max-rows 5 --budget-usd 50` 还会输出已校验的续跑规划，区分已终结、新行、可重试和次数耗尽的行；保持实际 worker 的输入顺序，按 `--max-rows` 选择本轮候选行。规划读取冻结输入、绑定／artifacts 及路径配置，跳过 dotenv 文件并保持进程环境不变；不创建输出目录或客户端，输出不含行标识、真实时间、模型文本或凭证。非目录的输出位置或父级会被拒绝。预算按新一轮运行计算，历史费用不从中扣减。配置预留估算复用实际预留规则，按各模型的最大输入和输出限额计算（目前每个可能调用模型的行约 $41.76），是注册价格估算，不能预测实际用量或验证中转账单；启动预算门槛单独显示，规划不能预测运行中途的停止。`--max-attempts`（默认 3）与 `--row-headroom-usd`（默认 $1.50）同时用于规划和实际运行，并写入 run manifest。真实中转回放仍需 `--allow-unverified-relay`。
+
 报告用量对应的费用超出有限数值表示范围时，释放并收取预留金额，完整费用记为未知（`cost_usd=null`、`cost_not_representable`），同时锁定预算。`BUDGET_OVERRUN` 阻断该行及后续调用。
 
 核心约束：
