@@ -1,7 +1,7 @@
 """Controlled provider bindings for the K3 reasoner and Jev judge roles.
 
-K3 runs only on Anthropic and Jev only on OpenAI; there is no cross-provider
-fallback. Model IDs, effort, limits and prices change only by editing this file.
+K3 runs on GPT-6 Astra and Jev on GPT-6.1 Sol through OpenAI Responses;
+there is no model or provider fallback. Bindings change only by editing this file.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from types import MappingProxyType
 from .interfaces import ModelUnavailable
 
 
-ROLE_PROVIDERS = MappingProxyType({"K3": "anthropic", "JEV": "openai"})
+ROLE_PROVIDERS = MappingProxyType({"K3": "openai", "JEV": "openai"})
 PROVIDER_EFFORTS = MappingProxyType({
     "anthropic": frozenset({"low", "medium", "high", "xhigh", "max"}),
     "openai": frozenset({"low", "medium", "high", "xhigh", "max"}),
@@ -81,28 +81,31 @@ class ModelBinding:
             _model_name(served, "accepted served model id")
 
     def max_call_cost_usd(self, input_bytes: int) -> float:
-        """Upper bound for one call including SDK retries: every input byte counted
-        as a token and the full output budget, for each possible attempt."""
-        per_attempt = (input_bytes * self.input_usd_per_mtok
+        """Reserve every input byte as a token at the highest OpenAI cache-write
+        rate (2.5x), plus the full output budget, for each possible attempt."""
+        per_attempt = (input_bytes * 2.5 * self.input_usd_per_mtok
                        + self.max_output_tokens * self.output_usd_per_mtok) / 1_000_000
         return per_attempt * (self.max_retries + 1)
 
     def call_cost_usd(self, input_tokens: int, output_tokens: int) -> float:
-        return (input_tokens * self.input_usd_per_mtok
-                + output_tokens * self.output_usd_per_mtok) / 1_000_000
+        # Scale integer counts before converting to float: large reported counts
+        # can still have a representable cost after the per-million conversion.
+        return (input_tokens / 1_000_000 * self.input_usd_per_mtok
+                + output_tokens / 1_000_000 * self.output_usd_per_mtok)
 
 
-# Facts verified 2026-11-02: claude-fable-5-1 $10/$50 per MTok, 128K output;
+# Facts verified 2026-11-04: https://developers.openai.com/api/docs/models/gpt-6-astra
+# gpt-6-astra $10/$50 per MTok, 128K output;
 # gpt-6.1-sol $2/$10 per MTok (input over 272K tokens is billed higher, so
 # max_input_bytes keeps requests far below that), 128K output, alias only.
 # max_retries=0: the SDKs must not retry silently (a timed-out attempt may still
 # be billed); a failed call ends BLOCKED.
 MODEL_BINDINGS = MappingProxyType({
     "K3": ModelBinding(
-        role="K3", provider="anthropic", model_id="claude-fable-5-1", effort="high",
+        role="K3", provider="openai", model_id="gpt-6-astra", effort="high",
         max_output_tokens=16_000, max_input_bytes=200_000, timeout_seconds=300.0,
         max_retries=0, input_usd_per_mtok=10.0, output_usd_per_mtok=50.0,
-        accepted_served_model_ids=("claude-fable-5-1",),
+        accepted_served_model_ids=("gpt-6-astra",),
     ),
     "JEV": ModelBinding(
         role="JEV", provider="openai", model_id="gpt-6.1-sol", effort="high",
@@ -243,10 +246,16 @@ class CostBudget:
             self._held += amount
         return Reservation(self, amount)
 
-    def settle(self, reservation: Reservation, charged_usd: float) -> bool:
-        """Returns True when the charge exceeded the reservation (the budget is then locked)."""
+    def settle(self, reservation: Reservation, charged_usd: float, *, lock_budget: bool = False) -> bool:
+        """Consume a hold once; lock on overrun or an unrepresentable reported cost.
+
+        For an unrepresentable cost the ledger charges the reservation, records
+        the full cost as unknown, and requests an atomic budget lock.
+        """
         if not isinstance(reservation, Reservation) or reservation._budget is not self:
             raise ValueError("reservation does not belong to this budget")
+        if type(lock_budget) is not bool:
+            raise TypeError("lock_budget must be a boolean")
         charged = _nonnegative(charged_usd, "charged_usd")
         with self._lock:
             if reservation.settled:
@@ -254,7 +263,7 @@ class CostBudget:
             reservation.settled = True
             self._held = max(0.0, self._held - reservation.amount)
             self._spent += charged
-            overrun = charged > reservation.amount
+            overrun = charged > reservation.amount or lock_budget
             if overrun:
                 self._locked = True
             return overrun

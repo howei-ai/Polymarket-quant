@@ -1,8 +1,8 @@
-"""Anthropic Messages API transport for the K3 reasoner role.
+"""OpenAI Responses API transport for the K3 reasoner role.
 
 The SDK client is injected and must come from provider_clients (pinned base URL,
 explicit routing only); this module never builds one, never sends sampling
-parameters, and never enables refusal fallbacks.
+parameters, sets store=False, and never enables refusal fallbacks.
 """
 
 from __future__ import annotations
@@ -11,16 +11,16 @@ from typing import Any, Mapping
 
 from .audit import canonical_json
 from .interfaces import ModelTimeout, ModelUnavailable
-from .model_registry import CostBudget, ModelBinding, Reservation, binding_for, require_registered_identity, route_for
+from .model_registry import CostBudget, ModelBinding, binding_for, require_registered_identity, route_for
 from .output_schemas import k3_output_schema
 from .provider_common import (
-    CallLedger, client_matches, error_detail, is_timeout, offline_call,
+    CallLedger, capture_openai_response_metadata, client_matches, error_detail, is_timeout, offline_call,
     parse_json_object, request_size_bytes, require_trusted_client, route_refusal, transport_version_for,
 )
 from .schemas import K3_ROLES, ModelCallRecord
 
 
-TRANSPORT_VERSION = "anthropic-k3-transport-v4"
+TRANSPORT_VERSION = "openai-k3-transport-v5"
 SYSTEM_PROMPT = (
     "You are K3, the research reasoner in a shadow-only research pipeline. "
     "The user message is one JSON request: follow its instruction for its role, using only "
@@ -29,30 +29,13 @@ SYSTEM_PROMPT = (
     "a trade or any other action. Reply only with the JSON object the response schema defines; "
     "keep evidence and risk entries to short factual statements, not a transcript of your reasoning."
 )
-_TRUNCATION_STOPS = ("max_tokens", "model_context_window_exceeded")
 
 
-def _input_tokens(usage: Any) -> tuple[Any, Any]:
-    """(raw, billable) input tokens. Raw is uncached input plus cache reads and writes, as
-    recorded; billable prices cache reads at 1x (billed lower) and cache writes at 2x (the
-    highest cache-write multiplier), conservative by design."""
-    base = getattr(usage, "input_tokens", None)
-    if type(base) is not int:
-        return None, None
-    raw = billable = base
-    for name, weight in (("cache_creation_input_tokens", 2), ("cache_read_input_tokens", 1)):
-        extra = getattr(usage, name, None)
-        if type(extra) is int and extra > 0:
-            raw += extra
-            billable += weight * extra
-    return raw, billable
-
-
-class AnthropicK3Transport:
+class OpenAIK3Transport:
     def __init__(self, client: Any, *, budget: CostBudget, binding: ModelBinding | None = None,
                  allow_test_client: bool = False, route: str = "official") -> None:
         self.binding = require_registered_identity(binding_for("K3") if binding is None else binding, "K3")
-        expected_base_url = route_for(route).base_urls["anthropic"]
+        expected_base_url = route_for(route).base_urls["openai"]
         test_client = require_trusted_client(client, expected_base_url=expected_base_url,
                                              allow_test_client=allow_test_client, route=route)
         self.transport_version = transport_version_for(TRANSPORT_VERSION, route, test_client)
@@ -75,7 +58,7 @@ class AnthropicK3Transport:
             return False
         return (self._ledger.binding is self.binding
                 and self.transport_version == transport_version_for(TRANSPORT_VERSION, route.name, test_client)
-                and client_matches(self._client, expected_base_url=route.base_urls["anthropic"],
+                and client_matches(self._client, expected_base_url=route.base_urls["openai"],
                                    test_client=test_client, route=route.name))
 
     def __call__(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -83,7 +66,7 @@ class AnthropicK3Transport:
         if role not in K3_ROLES:
             raise ValueError("K3 request must name a K3 role")
         binding, ledger = self.binding, self._ledger
-        if not AnthropicK3Transport._client_still_trusted(self):  # class function: an instance override is ignored
+        if not OpenAIK3Transport._client_still_trusted(self):  # class function: an instance override is ignored
             ledger.record(role, "CLIENT_UNTRUSTED")
             raise ModelUnavailable("K3 client no longer matches its trust level")
         refusal = route_refusal(ledger.route)
@@ -105,12 +88,15 @@ class AnthropicK3Transport:
             try:
                 response = self._client.with_options(
                     timeout=binding.timeout_seconds, max_retries=binding.max_retries,
-                ).messages.create(
+                ).responses.create(
                     model=binding.model_id,
-                    max_tokens=binding.max_output_tokens,
-                    system=SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": payload}],
-                    output_config={"effort": binding.effort, "format": {"type": "json_schema", "schema": schema}},
+                    instructions=SYSTEM_PROMPT,
+                    input=payload,
+                    reasoning={"effort": binding.effort},
+                    max_output_tokens=binding.max_output_tokens,
+                    store=False,
+                    text={"format": {"type": "json_schema", "name": "k3_" + role.lower(),
+                                     "schema": schema, "strict": True}},
                 )
             except Exception as exc:
                 if offline.blocked:
@@ -127,36 +113,35 @@ class AnthropicK3Transport:
             if offline.blocked:
                 ledger.record(role, "CLIENT_UNTRUSTED", reservation=reservation, detail="network_blocked")
                 raise ModelUnavailable("K3 test client tried to reach the network")
+            meta = {"reservation": reservation}
             try:
-                data = AnthropicK3Transport._interpret(self, role, response, reservation)
+                capture_openai_response_metadata(response, meta)
+                data = OpenAIK3Transport._interpret(self, role, response, meta)
             except ModelUnavailable:
+                if not reservation.settled:
+                    outcome, detail = (("CLIENT_UNTRUSTED", "network_blocked") if offline.blocked
+                                       else ("INVALID_OUTPUT", "unexpected_response_shape"))
+                    ledger.record(role, outcome, detail=detail, **meta)
                 raise
             except Exception as exc:
                 if not reservation.settled:
                     outcome, detail = (("CLIENT_UNTRUSTED", "network_blocked") if offline.blocked
                                        else ("INVALID_OUTPUT", "unexpected_response_shape"))
-                    ledger.record(role, outcome, reservation=reservation, detail=detail)
+                    ledger.record(role, outcome, detail=detail, **meta)
                 raise ModelUnavailable("K3 INVALID_OUTPUT") from exc
             except BaseException as exc:
                 if not reservation.settled:
-                    ledger.record(role, "INVALID_OUTPUT", reservation=reservation, detail=type(exc).__name__)
+                    ledger.record(role, "INVALID_OUTPUT", detail=type(exc).__name__, **meta)
                 raise
             if offline.blocked:  # the stand-in swallowed a blocked attempt while its output was read
                 ledger.record(role, "CLIENT_UNTRUSTED", detail="network_blocked")
                 raise ModelUnavailable("K3 test client tried to reach the network")
             return data
 
-    def _interpret(self, role: str, response: Any, reservation: Reservation) -> Mapping[str, Any]:
-        """Records exactly once, then returns the parsed object or raises ModelUnavailable."""
+    def _interpret(self, role: str, response: Any, meta: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Parse output and record with the metadata captured before parsing."""
         binding, ledger = self.binding, self._ledger
-        usage = getattr(response, "usage", None)
-        served = getattr(response, "model", None)
-        raw_input, billable_input = _input_tokens(usage)
-        meta = {
-            "reservation": reservation, "served": served, "request_id": getattr(response, "_request_id", None),
-            "input_tokens": raw_input, "billable_input_tokens": billable_input,
-            "output_tokens": getattr(usage, "output_tokens", None),
-        }
+        served = meta.get("served")
 
         def fail(outcome: str, detail: Any = None) -> ModelUnavailable:
             ledger.record(role, outcome, detail=detail, **meta)
@@ -164,17 +149,24 @@ class AnthropicK3Transport:
 
         if served not in binding.accepted_served_model_ids:
             raise fail("SERVED_MODEL_MISMATCH")
-        stop = getattr(response, "stop_reason", None)
-        if stop == "refusal":
-            raise fail("REFUSAL", getattr(getattr(response, "stop_details", None), "category", None))
-        if stop in _TRUNCATION_STOPS:
-            raise fail("TRUNCATED", stop)
-        if stop != "end_turn":
-            raise fail("UNEXPECTED_STOP", stop if isinstance(stop, str) else None)
-        texts = [getattr(block, "text", None) for block in getattr(response, "content", None) or ()
-                 if getattr(block, "type", None) == "text"]
+        status = getattr(response, "status", None)
+        if status == "incomplete":
+            reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
+            raise fail("REFUSAL" if reason == "content_filter" else "TRUNCATED", reason)
+        if status != "completed":
+            raise fail("UNEXPECTED_STOP", status if isinstance(status, str) else None)
+        texts: list[Any] = []
+        for item in getattr(response, "output", None) or ():
+            if getattr(item, "type", None) != "message":
+                continue
+            for part in getattr(item, "content", None) or ():
+                kind = getattr(part, "type", None)
+                if kind == "refusal":
+                    raise fail("REFUSAL")
+                if kind == "output_text":
+                    texts.append(getattr(part, "text", None))
         if len(texts) != 1 or not isinstance(texts[0], str):
-            raise fail("INVALID_OUTPUT", f"text_blocks:{len(texts)}")
+            raise fail("INVALID_OUTPUT", f"output_text_parts:{len(texts)}")
         try:
             data = parse_json_object(texts[0])
         except ValueError:

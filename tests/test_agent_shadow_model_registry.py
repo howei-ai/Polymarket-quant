@@ -11,11 +11,11 @@ from std0_quant.research.agent_shadow.model_registry import (
 from std0_quant.research.agent_shadow.schemas import ModelCallRecord
 
 
-def test_registry_binds_k3_to_fable_and_jev_to_gpt61sol():
+def test_registry_binds_k3_to_astra_and_jev_to_gpt61sol():
     assert set(MODEL_BINDINGS) == {"K3", "JEV"}
     k3, jev = binding_for("K3"), binding_for("JEV")
     assert (k3.provider, k3.model_id, k3.accepted_served_model_ids) == (
-        "anthropic", "claude-fable-5-1", ("claude-fable-5-1",))
+        "openai", "gpt-6-astra", ("gpt-6-astra",))
     assert (jev.provider, jev.model_id, jev.accepted_served_model_ids) == (
         "openai", "gpt-6.1-sol", ("gpt-6.1-sol",))
     assert (k3.input_usd_per_mtok, k3.output_usd_per_mtok) == (10.0, 50.0)
@@ -23,7 +23,7 @@ def test_registry_binds_k3_to_fable_and_jev_to_gpt61sol():
 
 
 @pytest.mark.parametrize("changes", [
-    {"provider": "openai"},
+    {"provider": "anthropic"},
     {"role": "JUDGE"},
     {"model_id": "claude-fable-latest", "accepted_served_model_ids": ("claude-fable-latest",)},
     {"model_id": " claude-fable-5-1"},
@@ -41,7 +41,7 @@ def test_registry_binds_k3_to_fable_and_jev_to_gpt61sol():
     {"input_usd_per_mtok": 0},
     {"output_usd_per_mtok": float("inf")},
     {"accepted_served_model_ids": ("claude-opus-5-5",)},
-    {"accepted_served_model_ids": ["claude-fable-5-1"]},
+    {"accepted_served_model_ids": ["gpt-6-astra"]},
 ])
 def test_binding_validation_rejects(changes):
     with pytest.raises(ValueError):
@@ -100,7 +100,7 @@ def test_cost_math_counts_every_possible_attempt():
     k3 = binding_for("K3")
     assert math.isclose(k3.call_cost_usd(1_000_000, 0), 10.0)
     assert math.isclose(k3.call_cost_usd(0, 1_000_000), 50.0)
-    one_attempt = (1_000 * 10 + 16_000 * 50) / 1_000_000
+    one_attempt = (1_000 * 2.5 * 10 + 16_000 * 50) / 1_000_000
     assert math.isclose(k3.max_call_cost_usd(1_000), one_attempt)
     assert math.isclose(dataclasses.replace(k3, max_retries=2).max_call_cost_usd(1_000), 3 * one_attempt)
 

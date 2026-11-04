@@ -78,6 +78,12 @@ Agent Shadow 实现在：
 src/std0_quant/research/agent_shadow/
 ```
 
+当前注册模型为 K3 `gpt-6-astra`（7 次研究调用）和 Jev `gpt-6.1-sol`（1 次判断），均使用 OpenAI Responses、`high` effort、严格 JSON 和 `store=False`，不回退到其他模型。`build_shadow_models(k3_client, jev_client, ...)` 现在接收两个 OpenAI 客户端，旧 Anthropic K3 transport 已移除。两个 transport 升至 v5，产物 schema 仍为 v4。[官方模型规格](https://developers.openai.com/api/docs/models/gpt-6-astra)列出的 Astra 标准输入／输出价为每百万 token $10／$50。缓存读取按普通输入价保守计入，缓存写入按 2.5 倍计入，预留也覆盖该写入倍率。缓存计数缺失或异常时保留合法的原始 token 数，至少按全额预留结算；较高的已知用量仍会保守计入并锁定预算。中转实际账单不能据此保证。
+
+回放 worker v3 在第一次调用前保存 `replay_binding.json`，绑定双方模型、运行限额、价格、通道、测试／真实来源、提示词版本和脱敏设置。续跑允许调整预算和行数；配置不同，或旧产物缺少绑定文件时，需要新输出目录，包括旧 Fable 回放。SDK 客户端在正常完成或初始化失败后都会关闭。
+
+报告用量对应的费用超出有限数值表示范围时，释放并收取预留金额，完整费用记为未知（`cost_usd=null`、`cost_not_representable`），同时锁定预算。`BUDGET_OVERRUN` 阻断该行及后续调用。
+
 核心约束：
 
 - 固定 analyst roles；

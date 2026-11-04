@@ -1,13 +1,14 @@
 import importlib.util
 import json
 import math
+import dataclasses
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from agent_shadow_provider_fakes import FakeAnthropicClient, FakeOpenAIClient
+from agent_shadow_provider_fakes import FakeOpenAIK3Client, FakeOpenAIClient
 from std0_quant.research.agent_shadow import provider_clients
 from std0_quant.research.agent_shadow.context import FEATURE_ALLOWLIST, META_ALLOWLIST
 from std0_quant.research.agent_shadow.model_registry import CostBudget
@@ -76,9 +77,9 @@ def _plan(features, provenance, **kwargs):
     return build_replay_plan(features, provenance, **kwargs)
 
 
-def _models(budget, anthropic_fake=None, openai_fake=None):
-    return provider_clients.build_shadow_models(anthropic_fake or FakeAnthropicClient(), openai_fake or FakeOpenAIClient(),
-                                                budget=budget, network_enabled=True, allow_test_clients=True)
+def _models(budget, k3_fake=None, openai_fake=None, *, route="official"):
+    return provider_clients.build_shadow_models(k3_fake or FakeOpenAIK3Client(), openai_fake or FakeOpenAIClient(),
+                                                budget=budget, network_enabled=True, allow_test_clients=True, route=route)
 
 
 def _writer(tmp_path, *extra):
@@ -113,11 +114,11 @@ def test_rows_are_projected_to_the_allowlist_and_redacted():
 
 def test_models_never_see_real_ids_times_prices_or_labels(tmp_path):
     rows = _plan([_feature("0xabc")], _provenance("0xabc")).rows
-    anthropic_fake, openai_fake = FakeAnthropicClient(), FakeOpenAIClient()
+    k3_fake, openai_fake = FakeOpenAIK3Client(), FakeOpenAIClient()
     budget = CostBudget(5.0)
     writer = _writer(tmp_path)
-    run_replay(rows, ShadowRunner(*_models(budget, anthropic_fake, openai_fake)), writer, budget, max_rows=1)
-    sent = json.dumps([call["messages"] for call in anthropic_fake.calls] + [call["input"] for call in openai_fake.calls])
+    run_replay(rows, ShadowRunner(*_models(budget, k3_fake, openai_fake)), writer, budget, max_rows=1)
+    sent = json.dumps([call["input"] for call in k3_fake.calls] + [call["input"] for call in openai_fake.calls])
     for secret in ("0xabc", str(CUTOFF), str(CUTOFF - 200), "112345.5", "112300.25", *LEAKY):
         assert secret not in sent
     (artifact,) = [json.loads(line) for line in writer.artifacts.read_text().splitlines()]
@@ -172,10 +173,10 @@ def test_failed_evidence_is_false(feature_changes, provenance_kwargs, failure):
 def test_missing_provenance_blocks_the_row_without_calls(tmp_path):
     (row,) = _plan([_feature("c1")], []).rows
     assert row.pit_row["btc_observed_ts_ms"] is None and "PROVENANCE" in row.evidence_failures
-    anthropic_fake = FakeAnthropicClient()
+    k3_fake = FakeOpenAIK3Client()
     budget = CostBudget(5.0)
-    summary = run_replay([row], ShadowRunner(*_models(budget, anthropic_fake)), _writer(tmp_path), budget, max_rows=5)
-    assert summary["gate_status_counts"] == {"BLOCKED": 1} and not anthropic_fake.calls
+    summary = run_replay([row], ShadowRunner(*_models(budget, k3_fake)), _writer(tmp_path), budget, max_rows=5)
+    assert summary["gate_status_counts"] == {"BLOCKED": 1} and not k3_fake.calls
 
 
 # Replay loop, retry semantics and budget (F2)
@@ -209,16 +210,16 @@ def test_budget_cut_rows_are_audited_and_retried(tmp_path):
 
 def test_headroom_check_stops_before_a_row_starts(tmp_path):
     budget = CostBudget(0.5)
-    anthropic_fake = FakeAnthropicClient()
-    summary = run_replay(_three_rows(), ShadowRunner(*_models(budget, anthropic_fake)), _writer(tmp_path), budget,
+    k3_fake = FakeOpenAIK3Client()
+    summary = run_replay(_three_rows(), ShadowRunner(*_models(budget, k3_fake)), _writer(tmp_path), budget,
                          max_rows=3, row_headroom_usd=1.0)
-    assert (summary["stop_reason"], summary["attempted"]) == ("BUDGET", 0) and not anthropic_fake.calls
+    assert (summary["stop_reason"], summary["attempted"]) == ("BUDGET", 0) and not k3_fake.calls
 
 
 def test_transient_failures_are_written_for_audit_but_retried(tmp_path):
     rows, writer = _three_rows()[:1], _writer(tmp_path)
     budget = CostBudget(5.0)
-    failing = FakeAnthropicClient(error=TimeoutError("slow"))
+    failing = FakeOpenAIK3Client(error=TimeoutError("slow"))
     first = run_replay(rows, ShadowRunner(*_models(budget, failing)), writer, budget, max_rows=1)
     assert (first["written"], first["written_retryable"]) == (1, 1)
     assert writer.done_ids() == set()
@@ -345,7 +346,7 @@ def test_rows_that_keep_failing_stop_being_retried(tmp_path):
     rows, writer = _three_rows()[:2], _writer(tmp_path)
     budget = CostBudget(20.0)
     for _ in range(2):
-        run_replay(rows[:1], ShadowRunner(*_models(budget, FakeAnthropicClient(error=TimeoutError("slow")))),
+        run_replay(rows[:1], ShadowRunner(*_models(budget, FakeOpenAIK3Client(error=TimeoutError("slow")))),
                    writer, budget, max_rows=1)
     summary = run_replay(rows, ShadowRunner(*_models(budget)), writer, budget, max_rows=1, max_attempts=2)
     assert summary["skipped_attempts_exhausted"] == 1 and summary["written"] == 1
@@ -366,3 +367,147 @@ def test_proxy_urls_need_a_known_scheme(monkeypatch):
     for bad in ("user:pass@127.0.0.1:7897", "ftp://127.0.0.1:21", "http://"):
         with pytest.raises(SystemExit):
             script._proxy_label(bad)
+
+
+def test_model_change_requires_a_fresh_replay_directory(tmp_path):
+    writer = _writer(tmp_path)
+    old = {"condition_id": "old", "gate_status": "SHADOW_ACCEPT", "gate_reasons": [], "model_calls": [],
+           "k3_model_id": "claude-fable-5-1", "jev_model_id": "gpt-6.1-sol"}
+    writer.artifacts.write_text(json.dumps(old) + "\n")
+    before = writer.artifacts.read_bytes()
+    budget = CostBudget(20.0)
+    with pytest.raises(ValueError, match="different model bindings"):
+        run_replay(_three_rows(), ShadowRunner(*_models(budget)), writer, budget, max_rows=1)
+    assert writer.artifacts.read_bytes() == before and budget.spent_usd == budget.held_usd == 0
+
+
+def test_script_uses_two_openai_clients_and_records_models(tmp_path, monkeypatch, capsys):
+    pins = _write_inputs(tmp_path / "in", [_feature("c1")], _provenance("c1"))
+    original_build = provider_clients.build_shadow_models
+    script = _script(monkeypatch, pins)
+    clients = [FakeOpenAIK3Client(), FakeOpenAIClient()]
+    built = []
+
+    def build(**kwargs):
+        built.append(kwargs)
+        return clients[len(built) - 1]
+
+    def models(*args, **kwargs):
+        return original_build(*args, **kwargs, allow_test_clients=True)
+
+    monkeypatch.setattr(script.provider_clients, "build_openai_client", build)
+    monkeypatch.setattr(script.provider_clients, "build_shadow_models", models)
+    out = tmp_path / "out"
+    assert script.main(["--input-dir", str(tmp_path / "in"), "--out-dir", str(out), "--max-rows", "1",
+                        "--budget-usd", "5", "--route", "relay_mtu", "--allow-unverified-relay"]) == 0
+    assert built == [{"proxy_url": None, "route": "relay_mtu"}] * 2
+    assert all(client.closed for client in clients)
+    assert len(clients[0].calls) == 7 and len(clients[1].calls) == 1
+    manifest = json.loads(next(out.glob("run_manifest_*.json")).read_text())
+    assert manifest["models"] == {
+        "K3": {"provider": "openai", "model_id": "gpt-6-astra", "effort": "high"},
+        "JEV": {"provider": "openai", "model_id": "gpt-6.1-sol", "effort": "high"},
+    }
+    assert json.loads(capsys.readouterr().out)["gate_status_counts"] == {"SHADOW_ACCEPT": 1}
+
+
+@pytest.mark.parametrize("first_route,next_route", [("official", "relay_mtu"), ("relay_mtu", "official")])
+def test_resume_refuses_a_different_route_before_any_call(tmp_path, first_route, next_route):
+    writer, rows = _writer(tmp_path), _three_rows()
+    first_budget = CostBudget(10.0)
+    first = ShadowRunner(*_models(first_budget, route=first_route), allow_unverified_relay=True)
+    run_replay(rows, first, writer, first_budget, max_rows=1)
+    previous = writer.artifacts.read_bytes(), writer.run_binding.read_bytes()
+    next_budget = CostBudget(10.0)
+    fake = FakeOpenAIK3Client()
+    next_runner = ShadowRunner(*_models(next_budget, fake, route=next_route), allow_unverified_relay=True)
+    with pytest.raises(ValueError, match="run binding differs"):
+        run_replay(rows, next_runner, writer, next_budget, max_rows=2)
+    assert not fake.calls and next_budget.spent_usd == next_budget.held_usd == 0
+    assert (writer.artifacts.read_bytes(), writer.run_binding.read_bytes()) == previous
+
+
+@pytest.mark.parametrize("change", ["missing", "unreadable", "trust_level"])
+def test_existing_replay_needs_the_same_readable_run_binding(tmp_path, change):
+    writer, rows = _writer(tmp_path), _three_rows()
+    budget = CostBudget(10.0)
+    run_replay(rows, ShadowRunner(*_models(budget)), writer, budget, max_rows=1)
+    if change == "missing":
+        writer.run_binding.unlink()
+    elif change == "unreadable":
+        writer.run_binding.write_text("{torn")
+    else:
+        binding = json.loads(writer.run_binding.read_text())
+        binding["provenance"] = "OFFICIAL"
+        writer.run_binding.write_text(json.dumps(binding))
+    previous = writer.artifacts.read_bytes()
+    next_budget, fake = CostBudget(10.0), FakeOpenAIK3Client()
+    with pytest.raises(ValueError, match="binding"):
+        run_replay(rows, ShadowRunner(*_models(next_budget, fake)), writer, next_budget, max_rows=2)
+    assert not fake.calls and next_budget.spent_usd == next_budget.held_usd == 0
+    assert writer.artifacts.read_bytes() == previous
+
+
+def test_script_checks_resume_binding_before_building_clients(tmp_path, monkeypatch):
+    pins = _write_inputs(tmp_path / "in", [_feature("c1")], _provenance("c1"))
+    script = _script(monkeypatch, pins)
+    writer = _writer(tmp_path)
+    from std0_quant.research.agent_shadow.replay import replay_run_binding
+
+    writer.validate_run_binding(replay_run_binding("official"), create=True)
+    with pytest.raises(ValueError, match="run binding differs"):
+        script.main(["--input-dir", str(tmp_path / "in"), "--out-dir", str(writer.out_dir), "--max-rows", "1",
+                     "--budget-usd", "5", "--route", "relay_mtu", "--allow-unverified-relay"])
+
+
+def test_run_binding_rejects_symlinks(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "replay_binding.json").symlink_to(tmp_path / "elsewhere.json")
+    with pytest.raises(ValueError, match="symlink"):
+        _writer(tmp_path)
+
+
+@pytest.mark.parametrize("limits", [{"max_output_tokens": 8000}, {"timeout_seconds": 60.0}])
+def test_replay_binding_records_tightened_operational_limits(tmp_path, limits):
+    writer, rows = _writer(tmp_path), _three_rows()
+    budget = CostBudget(10.0)
+    run_replay(rows, ShadowRunner(*_models(budget)), writer, budget, max_rows=1)
+    next_budget, fake = CostBudget(10.0), FakeOpenAIK3Client()
+    k3, jev = _models(next_budget, fake)
+    tightened = dataclasses.replace(k3._transport.binding, **limits)
+    k3._transport.binding = k3._transport._ledger.binding = tightened
+    with pytest.raises(ValueError, match="run binding differs"):
+        run_replay(rows, ShadowRunner(k3, jev), writer, next_budget, max_rows=2)
+    assert not fake.calls and next_budget.spent_usd == next_budget.held_usd == 0
+
+
+def test_script_closes_first_client_when_second_construction_fails(tmp_path, monkeypatch):
+    pins = _write_inputs(tmp_path / "in", [_feature("c1")], _provenance("c1"))
+    script = _script(monkeypatch, pins)
+    first = FakeOpenAIK3Client()
+    calls = []
+
+    def build(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            raise RuntimeError("second client unavailable")
+        return first
+
+    monkeypatch.setattr(script.provider_clients, "build_openai_client", build)
+    out = tmp_path / "out"
+    with pytest.raises(RuntimeError, match="second client unavailable"):
+        script.main(["--input-dir", str(tmp_path / "in"), "--out-dir", str(out), "--max-rows", "1",
+                     "--budget-usd", "5", "--route", "relay_mtu", "--allow-unverified-relay"])
+    assert first.closed and not first.calls and not (out / "artifacts.jsonl").exists()
+    assert not list(out.glob("run_manifest_*.json"))
+
+
+def test_replay_refuses_a_budget_that_does_not_guard_the_transports(tmp_path):
+    transport_budget, worker_budget, fake = CostBudget(100.0), CostBudget(1.0), FakeOpenAIK3Client()
+    runner = ShadowRunner(*_models(transport_budget, fake))
+    writer = _writer(tmp_path)
+    with pytest.raises(ValueError, match="shared budget"):
+        run_replay(_three_rows(), runner, writer, worker_budget, max_rows=1)
+    assert not fake.calls and transport_budget.spent_usd == worker_budget.spent_usd == 0
+    assert not writer.artifacts.exists() and not writer.run_binding.exists()

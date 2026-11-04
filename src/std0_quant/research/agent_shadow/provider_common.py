@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import json
+import math
 import sys
 import threading
 import types
@@ -322,6 +323,45 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return value
 
 
+def openai_input_tokens(usage: Any) -> tuple[Any, Any]:
+    """Keep the total input count as raw. Price cache reads at the ordinary
+    input rate and writes at the highest documented rate (2.5x, 12h TTL).
+    Round billable equivalents up so integer records remain conservative.
+    Missing or malformed cache counters leave billing unknown; the ledger
+    retains any valid raw count and charges at least the reservation."""
+    raw = getattr(usage, "input_tokens", None)
+    details = getattr(usage, "input_tokens_details", None)
+    writes = getattr(details, "cache_write_tokens", None)
+    reads = getattr(details, "cached_tokens", None)
+    if type(raw) is not int or raw < 0:
+        return None, None
+    if (type(writes) is not int or writes < 0
+            or type(reads) is not int or reads < 0 or reads + writes > raw):
+        return raw, None
+    return raw, raw + (3 * writes + 1) // 2
+
+
+def capture_openai_response_metadata(response: Any, metadata: dict[str, Any]) -> None:
+    """Capture billing before output parsing, retaining partial usage on failure.
+
+    Fill the caller's metadata incrementally so an unexpected response property
+    cannot discard counts already read. Billing stays unknown until all cache
+    counters have been validated; error paths settle with this same metadata.
+    """
+    metadata["billable_input_tokens"] = None
+    usage = getattr(response, "usage", None)
+    metadata["input_tokens"] = getattr(usage, "input_tokens", None)
+    metadata["output_tokens"] = getattr(usage, "output_tokens", None)
+    raw_input, billable_input = openai_input_tokens(usage)
+    metadata["input_tokens"] = raw_input
+    metadata["billable_input_tokens"] = billable_input
+    metadata["served"] = getattr(response, "model", None)
+    metadata["request_id"] = getattr(response, "_request_id", None)
+
+
+_DEFAULT_BILLABLE = object()
+
+
 class CallLedger:
     """Settles each reservation exactly once and collects audit records.
 
@@ -340,25 +380,48 @@ class CallLedger:
 
     def record(self, role: str, outcome: str, *, reservation: Reservation | None = None, served: Any = None,
                request_id: Any = None, detail: Any = None, input_tokens: Any = None,
-               output_tokens: Any = None, billable_input_tokens: Any = None,
+               output_tokens: Any = None, billable_input_tokens: Any = _DEFAULT_BILLABLE,
                budget_locked: bool = False) -> None:
         """reservation is the hold for this call (None if nothing was held).
         input_tokens is the raw count kept in the record; billable_input_tokens (default:
-        input_tokens) prices the call. Known usage is charged at list price; otherwise the full
-        reservation is charged, because a failed or timed-out request may still have been billed.
+        input_tokens) prices the call. Explicit None means billing is unknown.
+        Known usage is charged at list price. Unknown billing charges at least
+        the reservation; any higher estimate from known partial usage is also
+        charged. A failed or timed-out request may still have been billed.
         A charge above the reservation locks the budget; that record, and any refusal because the
-        budget is locked (budget_locked=True), carries budget_overrun=True."""
+        budget is locked (budget_locked=True), carries budget_overrun=True. If a
+        reported cost cannot be represented, release and charge the reservation,
+        lock the budget, and leave cost_usd null with cost_not_representable detail."""
         if self.route not in ROUTES:
             raise ModelUnavailable("call ledger route is no longer a registered route")
         in_tokens, out_tokens = token_count(input_tokens), token_count(output_tokens)
-        billable = in_tokens if billable_input_tokens is None else token_count(billable_input_tokens)
+        billable = in_tokens if billable_input_tokens is _DEFAULT_BILLABLE else token_count(billable_input_tokens)
         cost, upper_bound, overrun = None, False, budget_locked is True
         if reservation is not None:
-            if billable is not None and out_tokens is not None:
-                cost = self.binding.call_cost_usd(billable, out_tokens)
+            try:
+                if billable is not None and out_tokens is not None:
+                    cost = self.binding.call_cost_usd(billable, out_tokens)
+                else:
+                    cost, upper_bound = reservation.amount, True
+                    if in_tokens is not None:
+                        # Missing cache counters must not hide reported usage above
+                        # the reservation. Price all known input at the maximum write
+                        # rate and use the output limit when output usage is unknown.
+                        worst_input = (5 * in_tokens + 1) // 2
+                        estimate = self.binding.call_cost_usd(
+                            worst_input, self.binding.max_output_tokens if out_tokens is None else out_tokens)
+                        cost = max(cost, estimate)
+                    elif out_tokens is not None:
+                        # The reservation already covers the full requested output.
+                        cost += self.binding.call_cost_usd(0, max(0, out_tokens - self.binding.max_output_tokens))
+                if not math.isfinite(cost):
+                    raise OverflowError("reported cost is not representable")
+            except OverflowError:
+                cost, upper_bound = None, False
+                detail = f"{detail}:cost_not_representable" if isinstance(detail, str) else "cost_not_representable"
+                overrun = self.budget.settle(reservation, reservation.amount, lock_budget=True) or overrun
             else:
-                cost, upper_bound = reservation.amount, True
-            overrun = self.budget.settle(reservation, cost) or overrun
+                overrun = self.budget.settle(reservation, cost) or overrun
         self._records.append(ModelCallRecord(
             role=role, provider=self.binding.provider, requested_model_id=self.binding.model_id,
             served_model_id=short_text(served), request_id=short_text(request_id), outcome=outcome,

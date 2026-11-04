@@ -6,7 +6,7 @@ import logging
 from dataclasses import asdict
 from typing import Any, Mapping, NamedTuple
 
-from . import anthropic_k3_transport, openai_jev_transport
+from . import openai_k3_transport, openai_jev_transport
 from .analysts import K3_PROMPT_SCHEMA_VERSION, analyst_request
 from .audit import hash_k3_request, sha256_json
 from .context import ShadowContext, build_shadow_context
@@ -16,7 +16,7 @@ from .interfaces import ProbabilisticJudge, ReasoningModel
 from .jev_client import JevClient
 from .jev_questions import JEV_QUESTION_SCHEMA_VERSION, build_jev_request
 from .k3_client import K3Client
-from .model_registry import route_for
+from .model_registry import CostBudget, ModelBinding, binding_for, require_registered_identity, route_for
 from .provider_common import CallLedger, route_policy, transport_version_for
 from .research_manager import manager_request, validate_manager_synthesis
 from .schemas import (ANALYST_ROLES, DEBATE_ROLES, K3_ROLES, AnalystReport, GateEvidence,
@@ -27,7 +27,7 @@ SHADOW_SCHEMA_VERSION = "k3_jev_agent_shadow_v4"
 _EMPTY_HASH = sha256_json(None)
 _LOG = logging.getLogger(__name__)
 # (client class, transport class, transport version, roles) of each registered model path.
-_K3_PATH = (K3Client, anthropic_k3_transport.AnthropicK3Transport, anthropic_k3_transport.TRANSPORT_VERSION, K3_ROLES)
+_K3_PATH = (K3Client, openai_k3_transport.OpenAIK3Transport, openai_k3_transport.TRANSPORT_VERSION, K3_ROLES)
 _JEV_PATH = (JevClient, openai_jev_transport.OpenAIJevTransport, openai_jev_transport.TRANSPORT_VERSION, ("JEV",))
 
 
@@ -187,6 +187,26 @@ class ShadowRunner:
         self.reasoner = reasoner
         self.judge = judge
         self._seen: set[str] = set()
+
+    def replay_setup(self, budget: CostBudget) -> tuple[str, bool, dict[str, ModelBinding]]:
+        """Recorded route and trust level for one registered replay pair.
+
+        The worker binds these to its output directory before resuming; custom
+        or mixed model paths cannot establish a comparable replay configuration.
+        This does not drain records or replace the per-call provenance checks.
+        """
+        setups = tuple(_registered_setup(model, path) for model, path in
+                       ((self.reasoner, _K3_PATH), (self.judge, _JEV_PATH)))
+        if (setups[0] != setups[1] or setups[0][0] in (None, _INVALID)
+                or (self._k3_model_id, self._jev_model_id)
+                != (binding_for("K3").model_id, binding_for("JEV").model_id)):
+            raise ValueError("replay requires registered models on the same route and trust level")
+        if any(_registered_transport(model, path)._ledger.budget is not budget
+               for model, path in ((self.reasoner, _K3_PATH), (self.judge, _JEV_PATH))):
+            raise ValueError("replay budget must be the shared budget of both transports")
+        bindings = {role: require_registered_identity(_registered_transport(model, path).binding, role)
+                    for role, model, path in (("K3", self.reasoner, _K3_PATH), ("JEV", self.judge, _JEV_PATH))}
+        return setups[0][0], setups[0][1], bindings
 
     def run(self, row: Mapping[str, Any], evidence: GateEvidence) -> ShadowResult:
         """Every provider call of the row runs inside one route policy: relay calls need this

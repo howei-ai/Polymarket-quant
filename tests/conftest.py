@@ -30,6 +30,12 @@ def _agent_shadow_offline(request, monkeypatch):
     if not request.module.__name__.startswith("test_agent_shadow"):
         yield
         return
+    from std0_quant.research.agent_shadow.provider_clients import OFFICIAL_CREDENTIAL_ENV
+
+    # Dummy credentials and the explicit environment tests must be independent
+    # of credentials configured in the developer's shell.
+    for name in OFFICIAL_CREDENTIAL_ENV:
+        monkeypatch.delenv(name, raising=False)
     import socket
 
     # Last-step backstop. Each replacement first raises the audit event the real function would,

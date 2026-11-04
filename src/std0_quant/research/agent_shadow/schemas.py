@@ -158,7 +158,7 @@ class ModelCallRecord:
     test_client: bool
     route: str  # provider route the call was sent through (model_registry.ROUTES)
     billable_input_tokens: int | None = None  # priced input count; >= input_tokens (cache writes weigh more)
-    budget_overrun: bool = False  # charge exceeded its reservation, or refused because the budget locked
+    budget_overrun: bool = False  # overrun, unrepresentable cost, or refusal because the budget locked
 
     def __post_init__(self) -> None:
         if self.role not in K3_ROLES + ("JEV",):

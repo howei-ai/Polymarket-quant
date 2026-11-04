@@ -11,10 +11,10 @@ import openai
 import pytest
 
 from agent_shadow_fakes import FakeReasoner, pit_row
-from agent_shadow_provider_fakes import FakeAnthropicClient, FakeOpenAIClient
+from agent_shadow_provider_fakes import FakeOpenAIK3Client, FakeOpenAIClient
 from std0_quant.research.agent_shadow import provider_clients
 from std0_quant.research.agent_shadow.analysts import analyst_request
-from std0_quant.research.agent_shadow.anthropic_k3_transport import AnthropicK3Transport
+from std0_quant.research.agent_shadow.openai_k3_transport import OpenAIK3Transport
 from std0_quant.research.agent_shadow.context import build_shadow_context
 from std0_quant.research.agent_shadow.interfaces import ModelUnavailable
 from std0_quant.research.agent_shadow.jev_client import JevClient
@@ -33,7 +33,7 @@ EVIDENCE = GateEvidence(True, True, True)
 
 def _models(budget=None):
     return provider_clients.build_shadow_models(
-        FakeAnthropicClient(), FakeOpenAIClient(), budget=budget or CostBudget(5.0),
+        FakeOpenAIK3Client(), FakeOpenAIClient(), budget=budget or CostBudget(5.0),
         network_enabled=True, allow_test_clients=True)
 
 
@@ -42,8 +42,8 @@ def _first_k3_request():
 
 
 def _record(**changes):
-    values = dict(role="MICROSTRUCTURE", provider="anthropic", requested_model_id="claude-fable-5-1",
-                  served_model_id="claude-fable-5-1", request_id="req_forged", outcome="OK", detail=None,
+    values = dict(role="MICROSTRUCTURE", provider="openai", requested_model_id="gpt-6-astra",
+                  served_model_id="gpt-6-astra", request_id="req_forged", outcome="OK", detail=None,
                   input_tokens=1, output_tokens=1, cost_usd=0.0, cost_is_upper_bound=False, test_client=False, route="official")
     values.update(changes)
     return ModelCallRecord(**values)
@@ -51,9 +51,9 @@ def _record(**changes):
 
 class _ForgedReasoner(FakeReasoner):
     """Claims the registered labels and reports a real-looking call record (K1)."""
-    model_id = "claude-fable-5-1"
-    provider = "anthropic"
-    transport_version = "anthropic-k3-transport-v4"
+    model_id = "gpt-6-astra"
+    provider = "openai"
+    transport_version = "openai-k3-transport-v5"
 
     def drain_call_records(self):
         return (_record(),)
@@ -64,8 +64,8 @@ class _ForgedReasoner(FakeReasoner):
 def test_registered_pair_keeps_labels_and_records():
     result = ShadowRunner(*_models()).run(pit_row(), EVIDENCE)
     assert result.gate_status == "SHADOW_ACCEPT"
-    assert result.k3_transport_version == "anthropic-k3-transport-v4-test-client"
-    assert result.jev_transport_version == "openai-jev-transport-v4-test-client"
+    assert result.k3_transport_version == "openai-k3-transport-v5-test-client"
+    assert result.jev_transport_version == "openai-jev-transport-v5-test-client"
     assert len(result.model_calls) == 8 and all(call.test_client for call in result.model_calls)
 
 
@@ -79,7 +79,7 @@ def test_forged_model_object_cannot_claim_labels_or_records():
 
 def test_tampered_label_on_registered_pair_blocks():
     k3, jev = _models()
-    k3.transport_version = "anthropic-k3-transport-v4"  # drops the -test-client marker
+    k3.transport_version = "openai-k3-transport-v5"  # drops the -test-client marker
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
     assert (result.k3_provider, result.k3_transport_version) == ("unspecified", "unspecified")
@@ -101,10 +101,10 @@ def test_tampered_jev_label_blocks():
 
 
 def test_transport_subclass_is_not_registered():
-    class LocalTransport(AnthropicK3Transport):
+    class LocalTransport(OpenAIK3Transport):
         pass
 
-    transport = LocalTransport(FakeAnthropicClient(), budget=CostBudget(1.0), allow_test_client=True)
+    transport = LocalTransport(FakeOpenAIK3Client(), budget=CostBudget(1.0), allow_test_client=True)
     offline = K3Client(transport)
     assert (offline.provider, offline.transport_version) == ("unspecified", "unspecified")
     with pytest.raises(ValueError):
@@ -113,13 +113,13 @@ def test_transport_subclass_is_not_registered():
 
 # K2: raw input tokens are recorded; pricing stays conservative.
 
-def test_anthropic_records_raw_input_but_prices_cache_writes_at_double():
-    transport = AnthropicK3Transport(FakeAnthropicClient(cache_tokens=(100, 0)), budget=CostBudget(5.0),
+def test_k3_records_raw_input_but_prices_cache_writes_conservatively():
+    transport = OpenAIK3Transport(FakeOpenAIK3Client(cache_tokens=(100, 0)), budget=CostBudget(5.0),
                                      allow_test_client=True)
     transport(_first_k3_request())
     (call,) = transport.drain_call_records()
-    assert call.input_tokens == 1300
-    assert math.isclose(call.cost_usd, (1400 * 10 + 300 * 50) / 1_000_000)
+    assert call.input_tokens == 1200
+    assert math.isclose(call.cost_usd, (1350 * 10 + 300 * 50) / 1_000_000)
 
 
 # K3: a charge above its reservation is charged in full and locks the budget.
@@ -141,7 +141,7 @@ def test_settle_within_reservation_does_not_lock():
 
 def test_usage_above_reservation_is_noted_and_blocks_the_next_call():
     budget = CostBudget(50.0)
-    transport = AnthropicK3Transport(FakeAnthropicClient(usage=(900_000, 300)), budget=budget,
+    transport = OpenAIK3Transport(FakeOpenAIK3Client(usage=(900_000, 300)), budget=budget,
                                      allow_test_client=True)
     transport(_first_k3_request())
     with pytest.raises(ModelUnavailable):
@@ -154,8 +154,8 @@ def test_usage_above_reservation_is_noted_and_blocks_the_next_call():
 
 # K5: a test stand-in must not wrap a real SDK or HTTP client.
 
-def _real_anthropic():
-    return anthropic.Anthropic(api_key="sk-ant-test", base_url="https://api.anthropic.com")
+def _real_k3_sdk():
+    return openai.OpenAI(api_key="sk-test", base_url="https://api.openai.com/v1")
 
 
 def _real_openai():
@@ -172,11 +172,11 @@ class _Wrapper:
 
 @pytest.mark.parametrize("wrap", [
     lambda real: _Wrapper(real),
-    lambda real: SimpleNamespace(with_options=real.with_options, messages=real.messages),
+    lambda real: SimpleNamespace(with_options=real.with_options, responses=real.responses),
 ])
-def test_stand_in_plainly_wrapping_real_anthropic_client_is_refused_early(wrap):
+def test_stand_in_plainly_wrapping_real_k3_sdk_client_is_refused_early(wrap):
     with pytest.raises(ValueError):
-        AnthropicK3Transport(wrap(_real_anthropic()), budget=CostBudget(1.0), allow_test_client=True)
+        OpenAIK3Transport(wrap(_real_k3_sdk()), budget=CostBudget(1.0), allow_test_client=True)
 
 
 def test_stand_in_wrapping_real_openai_client_is_refused():
@@ -186,31 +186,31 @@ def test_stand_in_wrapping_real_openai_client_is_refused():
 
 def test_stand_in_wrapping_raw_http_client_is_refused():
     with pytest.raises(ValueError):
-        AnthropicK3Transport(SimpleNamespace(http=httpx2.Client()), budget=CostBudget(1.0),
+        OpenAIK3Transport(SimpleNamespace(http=httpx2.Client()), budget=CostBudget(1.0),
                              allow_test_client=True)
 
 
 def test_fake_holding_an_sdk_error_is_still_a_valid_stand_in():
     error = anthropic.APITimeoutError(request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"))
-    transport = AnthropicK3Transport(FakeAnthropicClient(error=error), budget=CostBudget(1.0),
+    transport = OpenAIK3Transport(FakeOpenAIK3Client(error=error), budget=CostBudget(1.0),
                                      allow_test_client=True)
     assert transport.transport_version.endswith("-test-client")
 
 
 # Review round 1 fixes.
 
-ANTHROPIC_KEY = {"ANTHROPIC_API_KEY": "sk-ant-test"}
+OPENAI_KEY = {"OPENAI_API_KEY": "sk-test"}
 _GLOBAL_CLIENT = None
 
 
-def _real_trusted_anthropic():
-    return provider_clients.build_anthropic_client(environ=ANTHROPIC_KEY)
+def _real_trusted_k3():
+    return provider_clients.build_openai_client(environ=OPENAI_KEY)
 
 
 def test_fake_swapped_into_real_transport_is_refused_and_blocks():
     budget = CostBudget(5.0)
-    transport = AnthropicK3Transport(_real_trusted_anthropic(), budget=budget)
-    transport._client = FakeAnthropicClient()
+    transport = OpenAIK3Transport(_real_trusted_k3(), budget=budget)
+    transport._client = FakeOpenAIK3Client()
     with pytest.raises(ModelUnavailable):
         transport(_first_k3_request())
     (call,) = transport.drain_call_records()
@@ -222,8 +222,8 @@ def test_fake_swapped_into_real_transport_is_refused_and_blocks():
 
 
 def test_real_client_swapped_into_test_transport_is_refused_before_any_request():
-    transport = AnthropicK3Transport(FakeAnthropicClient(), budget=CostBudget(5.0), allow_test_client=True)
-    transport._client = _real_trusted_anthropic()
+    transport = OpenAIK3Transport(FakeOpenAIK3Client(), budget=CostBudget(5.0), allow_test_client=True)
+    transport._client = _real_trusted_k3()
     with pytest.raises(ModelUnavailable):
         transport(_first_k3_request())
     assert transport.drain_call_records()[0].outcome == "CLIENT_UNTRUSTED"
@@ -231,7 +231,7 @@ def test_real_client_swapped_into_test_transport_is_refused_before_any_request()
 
 def _forge_real_labels(k3):
     """Every label and the ledger flag say 'real run', but the client is still a fake."""
-    k3.transport_version = k3._transport.transport_version = "anthropic-k3-transport-v4"
+    k3.transport_version = k3._transport.transport_version = "openai-k3-transport-v5"
     k3._transport._ledger.test_client = False
 
 
@@ -262,7 +262,7 @@ def test_instance_overrides_of_trust_check_and_drain_are_ignored():
     k3, jev = _models()
     k3._transport._client_still_trusted = lambda: True
     k3._transport.drain_call_records = lambda: ()
-    k3.transport_version = k3._transport.transport_version = "anthropic-k3-transport-v4"
+    k3.transport_version = k3._transport.transport_version = "openai-k3-transport-v5"
     k3._transport._ledger.test_client = False
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
@@ -280,7 +280,7 @@ def test_genuine_records_survive_an_instance_drain_override():
 def test_overrun_on_the_last_call_blocks_the_row():
     budget = CostBudget(50.0)
     k3, jev = provider_clients.build_shadow_models(
-        FakeAnthropicClient(), FakeOpenAIClient(usage=(9_000_000, 400)), budget=budget,
+        FakeOpenAIK3Client(), FakeOpenAIClient(usage=(9_000_000, 400)), budget=budget,
         network_enabled=True, allow_test_clients=True)
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "BUDGET_OVERRUN" in result.gate_reasons
@@ -296,11 +296,11 @@ def test_locked_budget_refusal_is_marked_and_blocks():
 
 
 def test_records_carry_billable_input_tokens():
-    transport = AnthropicK3Transport(FakeAnthropicClient(cache_tokens=(100, 0)), budget=CostBudget(5.0),
+    transport = OpenAIK3Transport(FakeOpenAIK3Client(cache_tokens=(100, 0)), budget=CostBudget(5.0),
                                      allow_test_client=True)
     transport(_first_k3_request())
     (call,) = transport.drain_call_records()
-    assert (call.input_tokens, call.billable_input_tokens) == (1300, 1400)
+    assert (call.input_tokens, call.billable_input_tokens) == (1200, 1350)
     with pytest.raises(ValueError):
         _record(input_tokens=10, billable_input_tokens=9)
 
@@ -336,10 +336,10 @@ class _PropertyFake:
 
 class _LazyFake:
     def with_options(self, **options):
-        return anthropic.Anthropic(api_key="sk-ant-test", base_url="https://api.anthropic.com").with_options(**options)
+        return openai.OpenAI(api_key="sk-test", base_url="https://api.openai.com/v1").with_options(**options)
 
 
-class _SwallowingFake(FakeAnthropicClient):
+class _SwallowingFake(FakeOpenAIK3Client):
     """Tries a socket, swallows the refusal, then answers like a normal fake."""
 
     def with_options(self, **options):
@@ -367,9 +367,9 @@ def _hidden_stand_ins(real, monkeypatch):
 
 
 def test_hidden_or_lazily_built_clients_are_blocked_at_call_time(monkeypatch):
-    for stand_in in _hidden_stand_ins(_real_anthropic(), monkeypatch):
+    for stand_in in _hidden_stand_ins(_real_k3_sdk(), monkeypatch):
         budget = CostBudget(5.0)
-        transport = AnthropicK3Transport(stand_in, budget=budget, allow_test_client=True)
+        transport = OpenAIK3Transport(stand_in, budget=budget, allow_test_client=True)
         with pytest.raises(ModelUnavailable):
             transport(_first_k3_request())
         (call,) = transport.drain_call_records()
@@ -388,8 +388,8 @@ def test_hidden_client_in_jev_stand_in_is_blocked_at_call_time():
 
 
 def test_hidden_client_blocks_the_whole_row(monkeypatch):
-    real = _real_anthropic()
-    k3 = K3Client(AnthropicK3Transport(SimpleNamespace(with_options=lambda **options: real.with_options(**options)),
+    real = _real_k3_sdk()
+    k3 = K3Client(OpenAIK3Transport(SimpleNamespace(with_options=lambda **options: real.with_options(**options)),
                                        budget=CostBudget(5.0), allow_test_client=True), network_enabled=True)
     _, jev = _models()
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
@@ -420,7 +420,7 @@ def test_guard_blocks_threads_and_subprocesses_inside_a_guarded_call():
 def test_swapped_binding_is_refused_and_blocks():
     k3, jev = _models()
     cheap = dataclasses.replace(k3._transport.binding, input_usd_per_mtok=0.0001,
-                                accepted_served_model_ids=("claude-fable-5-1", "claude-other"))
+                                accepted_served_model_ids=("gpt-6-astra", "claude-other"))
     k3._transport.binding = k3._transport._ledger.binding = cheap
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
@@ -428,8 +428,8 @@ def test_swapped_binding_is_refused_and_blocks():
 
 def test_fake_holding_sdk_response_types_is_accepted():
     canned = anthropic.types.Message.model_construct(id="msg_1", type="message", role="assistant",
-                                                     content=[], model="claude-fable-5-1")
-    transport = AnthropicK3Transport(SimpleNamespace(canned=canned, request=httpx2.Request("GET", "https://x.test")),
+                                                     content=[], model="gpt-6-astra")
+    transport = OpenAIK3Transport(SimpleNamespace(canned=canned, request=httpx2.Request("GET", "https://x.test")),
                                      budget=CostBudget(1.0), allow_test_client=True)
     assert transport.transport_version.endswith("-test-client")
 
@@ -449,7 +449,7 @@ def test_agent_shadow_tests_cannot_connect_sockets():
 
 # Review round 3: stand-in code runs only inside the guard; guard state handling; threat-model edges.
 
-class _HashProbeFake(FakeAnthropicClient):
+class _HashProbeFake(FakeOpenAIK3Client):
     """Trust checks must never run its __hash__/__eq__ (identity only)."""
     hashed = False
 
@@ -462,7 +462,7 @@ class _HashProbeFake(FakeAnthropicClient):
         return self is other
 
 
-class _ClassProbeFake(FakeAnthropicClient):
+class _ClassProbeFake(FakeOpenAIK3Client):
     """isinstance() consults __class__; that stand-in code must run inside the guard."""
 
     @property
@@ -470,11 +470,11 @@ class _ClassProbeFake(FakeAnthropicClient):
         import socket
 
         socket.socket().close()
-        return FakeAnthropicClient
+        return FakeOpenAIK3Client
 
 
 def test_trust_checks_never_run_stand_in_hash_or_eq():
-    transport = AnthropicK3Transport(_HashProbeFake(), budget=CostBudget(5.0), allow_test_client=True)
+    transport = OpenAIK3Transport(_HashProbeFake(), budget=CostBudget(5.0), allow_test_client=True)
     transport(_first_k3_request())
     assert transport.drain_call_records()[0].outcome == "OK"
     assert _HashProbeFake.hashed is False
@@ -482,13 +482,13 @@ def test_trust_checks_never_run_stand_in_hash_or_eq():
 
 def test_stand_in_code_run_by_checks_is_inside_the_guard():
     with pytest.raises(ValueError):
-        AnthropicK3Transport(_ClassProbeFake(), budget=CostBudget(1.0), allow_test_client=True)
+        OpenAIK3Transport(_ClassProbeFake(), budget=CostBudget(1.0), allow_test_client=True)
 
 
 def test_stand_in_holding_a_factory_built_client_is_refused():
-    trusted = _real_trusted_anthropic()
+    trusted = _real_trusted_k3()
     with pytest.raises(ValueError):
-        AnthropicK3Transport(SimpleNamespace(spare=trusted), budget=CostBudget(1.0), allow_test_client=True)
+        OpenAIK3Transport(SimpleNamespace(spare=trusted), budget=CostBudget(1.0), allow_test_client=True)
 
 
 def test_offline_call_nests_and_restores_state_after_errors():
@@ -522,9 +522,9 @@ def test_other_threads_are_outside_the_guard_by_design():
 
 def test_real_client_calls_are_unaffected_after_the_guard_is_installed(monkeypatch):
     install_offline_guard()
-    real = _real_trusted_anthropic()
-    monkeypatch.setattr(real, "with_options", lambda **options: FakeAnthropicClient())
-    transport = AnthropicK3Transport(real, budget=CostBudget(5.0))
+    real = _real_trusted_k3()
+    monkeypatch.setattr(real, "with_options", lambda **options: FakeOpenAIK3Client())
+    transport = OpenAIK3Transport(real, budget=CostBudget(5.0))
     transport(_first_k3_request())
     (call,) = transport.drain_call_records()
     assert call.outcome == "OK" and call.test_client is False
@@ -540,7 +540,7 @@ def test_ctypes_calls_are_blocked_inside_a_guarded_call():
 
 
 def test_blocked_attempt_then_base_exception_is_recorded_as_untrusted():
-    class _Interrupting(FakeAnthropicClient):
+    class _Interrupting(FakeOpenAIK3Client):
         def with_options(self, **options):
             import socket
 
@@ -550,7 +550,7 @@ def test_blocked_attempt_then_base_exception_is_recorded_as_untrusted():
                 pass
             raise KeyboardInterrupt
 
-    transport = AnthropicK3Transport(_Interrupting(), budget=CostBudget(5.0), allow_test_client=True)
+    transport = OpenAIK3Transport(_Interrupting(), budget=CostBudget(5.0), allow_test_client=True)
     with pytest.raises(KeyboardInterrupt):
         transport(_first_k3_request())
     (call,) = transport.drain_call_records()
@@ -560,9 +560,9 @@ def test_blocked_attempt_then_base_exception_is_recorded_as_untrusted():
 # Final review fixes: outputs must come through the registered path; bindings are exact.
 
 def _real_k3(monkeypatch):
-    real = _real_trusted_anthropic()
-    monkeypatch.setattr(real, "with_options", lambda **options: FakeAnthropicClient())
-    return K3Client(AnthropicK3Transport(real, budget=CostBudget(5.0)), network_enabled=True)
+    real = _real_trusted_k3()
+    monkeypatch.setattr(real, "with_options", lambda **options: FakeOpenAIK3Client())
+    return K3Client(OpenAIK3Transport(real, budget=CostBudget(5.0)), network_enabled=True)
 
 
 def _real_jev(monkeypatch):
@@ -597,14 +597,14 @@ def test_calls_without_records_block_the_row(monkeypatch):
     k3 = _real_k3(monkeypatch)
     jev = _real_jev(monkeypatch)
     runner = ShadowRunner(k3, jev)
-    original = AnthropicK3Transport.__call__
+    original = OpenAIK3Transport.__call__
 
     def unrecorded(self, request):
         data = original(self, request)
         self._ledger._records.clear()
         return data
 
-    monkeypatch.setattr(AnthropicK3Transport, "__call__", unrecorded)
+    monkeypatch.setattr(OpenAIK3Transport, "__call__", unrecorded)
     result = runner.run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
 
@@ -622,7 +622,7 @@ def test_binding_subclass_is_rejected():
     free = FreeBinding(**{field.name: getattr(binding_for("K3"), field.name)
                           for field in dataclasses.fields(ModelBinding)})
     with pytest.raises(ValueError):
-        AnthropicK3Transport(FakeAnthropicClient(), budget=CostBudget(1.0), binding=free, allow_test_client=True)
+        OpenAIK3Transport(FakeOpenAIK3Client(), budget=CostBudget(1.0), binding=free, allow_test_client=True)
     k3, jev = _models()
     k3._transport.binding = k3._transport._ledger.binding = free
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
