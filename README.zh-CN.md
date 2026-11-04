@@ -82,6 +82,8 @@ src/std0_quant/research/agent_shadow/
 
 回放 worker v3 在第一次调用前保存 `replay_binding.json`，绑定双方模型、运行限额、价格、通道、测试／真实来源、提示词版本和脱敏设置。续跑允许调整预算和行数；配置不同，或旧产物缺少绑定文件时，需要新输出目录，包括旧 Fable 回放。SDK 客户端在正常完成或初始化失败后都会关闭。
 
+`python scripts/summarize_agent_shadow_replay.py --input-dir /tmp/shadow-replay` 只读 v3 回放目录并向 stdout 输出 JSON 汇总。工具校验 artifact 哈希、schema 和绑定一致性，分别统计所有尝试、每行最后状态及已终结结果；最终接受率以所有已终结行为分母，包含最终 BLOCKED 行，排除未终结及产物中不存在的行。重试费用累计计入，已定价记录（含预留估算）的费用以十进制字符串求和，null 费用保留为未定价记录计数。未终结行可能已耗尽重试次数。输出仅含聚合数据，不含行标识、request id 或模型文本；读取范围为绑定和 artifacts，不调用模型、不写文件。哈希检查表示完整性，不证明原始证据真实性或中转账单。
+
 报告用量对应的费用超出有限数值表示范围时，释放并收取预留金额，完整费用记为未知（`cost_usd=null`、`cost_not_representable`），同时锁定预算。`BUDGET_OVERRUN` 阻断该行及后续调用。
 
 核心约束：
