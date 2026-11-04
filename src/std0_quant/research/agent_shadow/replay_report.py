@@ -7,14 +7,15 @@ Reports contain aggregates only, never identifiers, model text or request ids.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from decimal import Decimal, localcontext
 import hashlib
 import json
 import math
 from pathlib import Path
 import re
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from .audit import canonical_json, sha256_json
 from .deterministic_gate import classify_shadow
@@ -43,6 +44,15 @@ GATE_REASONS = frozenset({
 
 class ReplayReportError(ValueError):
     """Input cannot be summarized consistently; messages never include row data."""
+
+
+@dataclass(frozen=True)
+class ReplayState:
+    """Validated local resume state. Identifiers must not appear in CLI reports."""
+    binding: dict[str, Any]
+    sources: dict[str, Any]
+    done_ids: frozenset[str]
+    nonfinal_attempts: Mapping[str, int]
 
 
 def _pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -210,7 +220,7 @@ def _add_calls(stats: dict[str, Any], call: ModelCallRecord) -> None:
     stats["budget_overrun_records"] += call.budget_overrun
 
 
-def summarize_replay(directory: Path) -> dict[str, Any]:
+def _summarize_replay(directory: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
     """Validate a v3 directory and aggregate every attempt, including retry costs.
 
     Final row counts use replay.is_final; unresolved rows may have exhausted
@@ -286,4 +296,25 @@ def summarize_replay(directory: Path) -> dict[str, Any]:
         "execution_allowed": False, "formal_cohort_effect": False,
     }
     report["report_sha256"] = sha256_json(report)
-    return report
+    return report, binding, rows
+
+
+def summarize_replay(directory: Path) -> dict[str, Any]:
+    """Validate a v3 directory and aggregate all attempts, including retry costs.
+
+    Final counts use replay.is_final; unresolved rows may have exhausted their
+    attempt cap. Reads only binding/artifacts and returns no row identifiers.
+    """
+    return _summarize_replay(directory)[0]
+
+
+def read_replay_state(directory: Path) -> ReplayState:
+    """Read resume state in the same validation pass as the aggregate report.
+
+    This local API retains redacted ids for matching to frozen input rows. It
+    never reads the redaction map or emits identifiers, text or request ids.
+    """
+    report, binding, rows = _summarize_replay(directory)
+    return ReplayState(binding, report["sources"],
+                       frozenset(key for key, row in rows.items() if row["final"]),
+                       MappingProxyType({key: row["attempts"] for key, row in rows.items() if not row["final"]}))

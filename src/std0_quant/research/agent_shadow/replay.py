@@ -273,15 +273,24 @@ def is_final(payload: Mapping[str, Any]) -> bool:
     return not (reasons & (RETRYABLE_REASONS | STOP_REASONS) or outcomes & RETRYABLE_OUTCOMES)
 
 
+def replay_output_path(out_dir: Path, forbidden_roots: Iterable[Path]) -> Path:
+    """Validate an output location without creating it or opening any files."""
+    resolved = Path(out_dir).expanduser().resolve()
+    for path in (resolved, *resolved.parents):
+        if path.exists() and not path.is_dir():
+            raise ValueError("replay output and its existing parents must be directories")
+    for root in forbidden_roots:
+        root = Path(root).expanduser().resolve()
+        if _inside(resolved, root) or _inside(root, resolved):
+            raise ValueError(f"replay output must be outside (and not contain) {root}")
+    return resolved
+
+
 class ReplayWriter:
     """Append-only SHADOW artifacts in an output directory outside every forbidden root."""
 
     def __init__(self, out_dir: Path, *, forbidden_roots: Iterable[Path]) -> None:
-        resolved = Path(out_dir).expanduser().resolve()
-        for root in forbidden_roots:
-            root = Path(root).expanduser().resolve()
-            if _inside(resolved, root) or _inside(root, resolved):
-                raise ValueError(f"replay output must be outside (and not contain) {root}")
+        resolved = replay_output_path(out_dir, forbidden_roots)
         resolved.mkdir(parents=True, exist_ok=True)
         self.out_dir = resolved
         self.artifacts = resolved / ARTIFACTS_FILE
