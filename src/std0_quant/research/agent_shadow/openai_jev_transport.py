@@ -11,16 +11,16 @@ from typing import Any, Mapping
 
 from .audit import canonical_json
 from .interfaces import ModelTimeout, ModelUnavailable
-from .model_registry import CostBudget, ModelBinding, Reservation, binding_for, require_registered_identity, route_for
+from .model_registry import CostBudget, ModelBinding, binding_for, require_registered_identity, route_for
 from .output_schemas import jev_output_schema
 from .provider_common import (
-    CallLedger, client_matches, error_detail, is_timeout, offline_call,
+    CallLedger, capture_openai_response_metadata, client_matches, error_detail, is_timeout, offline_call,
     parse_json_object, request_size_bytes, require_trusted_client, route_refusal, transport_version_for,
 )
 from .schemas import ModelCallRecord
 
 
-TRANSPORT_VERSION = "openai-jev-transport-v4"
+TRANSPORT_VERSION = "openai-jev-transport-v5"
 INSTRUCTIONS = (
     "You are Jev, the typed judge in a shadow-only research pipeline. The input is one JSON "
     "object with a pre-cutoff research state and five fixed questions with criteria. Answer "
@@ -109,35 +109,35 @@ class OpenAIJevTransport:
             if offline.blocked:
                 ledger.record("JEV", "CLIENT_UNTRUSTED", reservation=reservation, detail="network_blocked")
                 raise ModelUnavailable("Jev test client tried to reach the network")
+            meta = {"reservation": reservation}
             try:
-                data = OpenAIJevTransport._interpret(self, response, reservation)
+                capture_openai_response_metadata(response, meta)
+                data = OpenAIJevTransport._interpret(self, response, meta)
             except ModelUnavailable:
+                if not reservation.settled:
+                    outcome, detail = (("CLIENT_UNTRUSTED", "network_blocked") if offline.blocked
+                                       else ("INVALID_OUTPUT", "unexpected_response_shape"))
+                    ledger.record("JEV", outcome, detail=detail, **meta)
                 raise
             except Exception as exc:
                 if not reservation.settled:
                     outcome, detail = (("CLIENT_UNTRUSTED", "network_blocked") if offline.blocked
                                        else ("INVALID_OUTPUT", "unexpected_response_shape"))
-                    ledger.record("JEV", outcome, reservation=reservation, detail=detail)
+                    ledger.record("JEV", outcome, detail=detail, **meta)
                 raise ModelUnavailable("Jev INVALID_OUTPUT") from exc
             except BaseException as exc:
                 if not reservation.settled:
-                    ledger.record("JEV", "INVALID_OUTPUT", reservation=reservation, detail=type(exc).__name__)
+                    ledger.record("JEV", "INVALID_OUTPUT", detail=type(exc).__name__, **meta)
                 raise
             if offline.blocked:  # the stand-in swallowed a blocked attempt while its output was read
                 ledger.record("JEV", "CLIENT_UNTRUSTED", detail="network_blocked")
                 raise ModelUnavailable("Jev test client tried to reach the network")
             return data
 
-    def _interpret(self, response: Any, reservation: Reservation) -> Mapping[str, Any]:
-        """Records exactly once, then returns the parsed object or raises ModelUnavailable."""
+    def _interpret(self, response: Any, meta: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Parse output and record with the metadata captured before parsing."""
         binding, ledger = self.binding, self._ledger
-        usage = getattr(response, "usage", None)
-        served = getattr(response, "model", None)
-        meta = {
-            "reservation": reservation, "served": served, "request_id": getattr(response, "_request_id", None),
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-        }
+        served = meta.get("served")
 
         def fail(outcome: str, detail: Any = None) -> ModelUnavailable:
             ledger.record("JEV", outcome, detail=detail, **meta)

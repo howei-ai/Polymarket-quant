@@ -8,8 +8,8 @@
 
 Rows are redacted before they reach a model (hashed condition id, timestamps shifted to a
 synthetic epoch, absolute BTC price levels dropped); the real ids stay in a local mapping file.
-Credentials come from the environment of the chosen route (official: ANTHROPIC_API_KEY /
-OPENAI_API_KEY; relay_mtu: STD0_RELAY_API_KEY). A relay run needs --allow-unverified-relay and
+Credentials come from the chosen route (official: OPENAI_API_KEY; relay_mtu:
+STD0_RELAY_API_KEY). A relay run needs --allow-unverified-relay and
 its artifacts are labelled UNVERIFIED_RELAY. Nothing here writes data/, the formal cohort or
 frozen artifacts, submits orders, publishes, or runs a backtest.
 """
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import closing
 import json
 import math
 from pathlib import Path
@@ -31,9 +32,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from std0_quant.config import load_settings, resolve_path  # noqa: E402
 from std0_quant.research.agent_shadow import provider_clients  # noqa: E402
-from std0_quant.research.agent_shadow.model_registry import ROUTES, CostBudget  # noqa: E402
+from std0_quant.research.agent_shadow.model_registry import ROUTES, CostBudget, binding_for  # noqa: E402
 from std0_quant.research.agent_shadow.replay import (  # noqa: E402
-    REPLAY_VERSION, ReplayWriter, build_replay_plan, load_frozen_inputs, run_replay,
+    REPLAY_VERSION, ReplayWriter, build_replay_plan, load_frozen_inputs, replay_run_binding, run_replay,
 )
 from std0_quant.research.agent_shadow.runner import ShadowRunner  # noqa: E402
 
@@ -117,22 +118,26 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary_plan, indent=2, sort_keys=True))
         return 0
     writer = ReplayWriter(args.out_dir, forbidden_roots=_forbidden_roots(args.input_dir))
+    writer.attempt_state(model_ids=(binding_for("K3").model_id, binding_for("JEV").model_id))
+    writer.validate_run_binding(replay_run_binding(args.route))
     budget = CostBudget(args.budget_usd)
-    k3, jev = provider_clients.build_shadow_models(
-        provider_clients.build_anthropic_client(proxy_url=args.proxy_url, route=args.route),
-        provider_clients.build_openai_client(proxy_url=args.proxy_url, route=args.route),
-        budget=budget, network_enabled=True, route=args.route)
-    runner = ShadowRunner(k3, jev, allow_unverified_relay=args.allow_unverified_relay)
-    manifest = {
-        **summary_plan, "code_head": _git_head(), "route": args.route, "provenance": ROUTES[args.route].provenance,
-        "max_rows": args.max_rows, "budget_usd": args.budget_usd, "proxy": _proxy_label(args.proxy_url),
-        "inputs": {name: {"file": item["path"].name, "sha256": item["sha256"], "rows": len(item["records"])}
-                   for name, item in inputs.items()},
-        "execution_allowed": False, "formal_cohort_effect": False,
-    }
-    writer.write_once("run_manifest", manifest)
-    summary = run_replay(rows, runner, writer, budget, max_rows=args.max_rows)
-    writer.write_once("run_summary", summary)
+    with (closing(provider_clients.build_openai_client(proxy_url=args.proxy_url, route=args.route)) as k3_sdk,
+          closing(provider_clients.build_openai_client(proxy_url=args.proxy_url, route=args.route)) as jev_sdk):
+        k3, jev = provider_clients.build_shadow_models(
+            k3_sdk, jev_sdk, budget=budget, network_enabled=True, route=args.route)
+        runner = ShadowRunner(k3, jev, allow_unverified_relay=args.allow_unverified_relay)
+        manifest = {
+            **summary_plan, "code_head": _git_head(), "route": args.route, "provenance": ROUTES[args.route].provenance,
+            "models": {role: {"provider": binding_for(role).provider, "model_id": binding_for(role).model_id,
+                              "effort": binding_for(role).effort} for role in ("K3", "JEV")},
+            "max_rows": args.max_rows, "budget_usd": args.budget_usd, "proxy": _proxy_label(args.proxy_url),
+            "inputs": {name: {"file": item["path"].name, "sha256": item["sha256"], "rows": len(item["records"])}
+                       for name, item in inputs.items()},
+            "execution_allowed": False, "formal_cohort_effect": False,
+        }
+        writer.write_once("run_manifest", manifest)
+        summary = run_replay(rows, runner, writer, budget, max_rows=args.max_rows)
+        writer.write_once("run_summary", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

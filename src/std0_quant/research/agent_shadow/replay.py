@@ -7,11 +7,12 @@ bytes that are parsed). Each cutoff_1 row is projected to the point-in-time allo
 from the provenance file, and its GateEvidence is derived fail-closed: any check that cannot
 be established is False, which blocks the row.
 
-Rows are redacted before they reach a model, so a model cannot recognise the real market
-or minute: the condition id becomes a one-way hash, every timestamp is shifted so the
+Rows are redacted before they reach a model to reduce identification risk:
+the condition id becomes a salted hash, every timestamp is shifted so the
 decision cutoff sits at a fixed synthetic epoch (relative timing is kept), and absolute BTC
 price levels are dropped (relative BTC features are kept). The real identifiers stay only in
-a local mapping file next to the artifacts.
+a local mapping file next to the artifacts. The salt is public; someone with
+the candidate condition ids can recompute their hashes.
 
 Outputs are append-only SHADOW artifacts outside the repository and outside the inputs.
 Nothing here writes the formal cohort, frozen artifacts or data/, submits orders, publishes,
@@ -25,7 +26,7 @@ import json
 import math
 import os
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -34,13 +35,18 @@ from typing import Any, Iterable, Mapping
 from ...audit.sanity_audit_v2 import sanity_audit_v2
 from ...features.provenance import PUBLIC_SOURCES, validate_provenance
 from .audit import canonical_json
+from .analysts import K3_PROMPT_SCHEMA_VERSION
 from .context import FEATURE_ALLOWLIST
-from .model_registry import CostBudget
+from .jev_questions import JEV_QUESTION_SCHEMA_VERSION
+from .model_registry import CostBudget, ModelBinding, binding_for, require_registered_identity, route_for
+from .openai_jev_transport import TRANSPORT_VERSION as JEV_TRANSPORT_VERSION
+from .openai_k3_transport import TRANSPORT_VERSION as K3_TRANSPORT_VERSION
+from .provider_common import transport_version_for
 from .runner import ShadowRunner
 from .schemas import GateEvidence, ShadowResult
 
 
-REPLAY_VERSION = "agent_shadow_replay_v2"
+REPLAY_VERSION = "agent_shadow_replay_v3"
 FROZEN_RUN_SUFFIX = "prospective-v4-lowmem-20260829T073235Z.parquet"
 # File names inside the frozen features directory, pinned SHA-256 (same pins as
 # scripts/compare_sanity_audit_v2.py) and row counts. Any mismatch refuses the replay.
@@ -59,12 +65,14 @@ REDACTION_SALT = "std0-agent-shadow-replay-v2"
 REDACTED_FEATURES = frozenset({"btc_last_price", "btc_start_price"})
 ARTIFACTS_FILE = "artifacts.jsonl"
 REDACTION_MAP_FILE = "redaction_map.jsonl"
+RUN_BINDING_FILE = "replay_binding.json"
 # Call outcomes and gate reasons that mean the row should be attempted again, not counted as done.
 RETRYABLE_OUTCOMES = frozenset({"TIMEOUT", "API_ERROR", "BUDGET_EXCEEDED"})
 RETRYABLE_REASONS = frozenset({"K3_TIMEOUT", "JEV_TIMEOUT", "BUDGET_OVERRUN"})
 # Reasons that mean the setup itself is broken: stop the run instead of writing more BLOCKED rows.
 STOP_REASONS = frozenset({"MODEL_PROVENANCE_INVALID", "RELAY_NOT_ALLOWED", "MODEL_ROUTE_MIXED", "TEST_CLIENT_MIXED"})
-# Budget headroom required before a row starts (about one row's worst-case reservations).
+# Minimum starting headroom; per-call reservations enforce the estimate guard.
+# This is not a worst-case upper bound for a whole row.
 DEFAULT_ROW_HEADROOM_USD = 1.5
 # Attempts after which a row that never reached a final result is no longer retried.
 DEFAULT_MAX_ATTEMPTS = 3
@@ -72,6 +80,31 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 def sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def replay_run_binding(route: str, *, test_clients: bool = False,
+                       bindings: Mapping[str, ModelBinding] | None = None) -> dict[str, Any]:
+    """The model, route, prompt and redaction configuration of a replay directory.
+
+    Budgets and row limits may change on resume. These settings must stay fixed.
+    """
+    selected = route_for(route)
+    if type(test_clients) is not bool:
+        raise TypeError("test_clients must be a boolean")
+    models = {role: asdict(require_registered_identity(binding_for(role) if bindings is None else bindings[role], role))
+              for role in ("K3", "JEV")}
+    versions = {"K3": K3_TRANSPORT_VERSION, "JEV": JEV_TRANSPORT_VERSION}
+    for role in models:
+        models[role]["transport_version"] = transport_version_for(versions[role], route, test_clients)
+    return {
+        "schema_version": "agent_shadow_replay_binding_v1", "replay_version": REPLAY_VERSION,
+        "route": route, "provenance": "TEST_CLIENT" if test_clients else selected.provenance,
+        "models": models,
+        "k3_prompt_schema_version": K3_PROMPT_SCHEMA_VERSION,
+        "jev_question_schema_version": JEV_QUESTION_SCHEMA_VERSION,
+        "redaction": {"salt_sha256": sha256_bytes(REDACTION_SALT.encode()),
+                      "cutoff_ts_ms": REDACTED_CUTOFF_MS, "dropped_features": sorted(REDACTED_FEATURES)},
+    }
 
 
 def load_frozen_inputs(directory: Path, pins: Mapping[str, tuple] = FROZEN_INPUTS) -> dict[str, dict[str, Any]]:
@@ -253,15 +286,40 @@ class ReplayWriter:
         self.out_dir = resolved
         self.artifacts = resolved / ARTIFACTS_FILE
         self.redaction_map = resolved / REDACTION_MAP_FILE
-        for path in (self.artifacts, self.redaction_map):
+        self.run_binding = resolved / RUN_BINDING_FILE
+        for path in (self.artifacts, self.redaction_map, self.run_binding):
             if path.is_symlink():
                 raise ValueError(f"{path} must not be a symlink")
+
+    def validate_run_binding(self, binding: Mapping[str, Any], *, create: bool = False) -> None:
+        """Refuse incompatible resumes; persist a new binding before the first call.
+
+        Existing artifacts without a binding need a fresh output directory.
+        An unreadable or partly written binding fails closed.
+        """
+        expected = canonical_json(binding)
+        if self.run_binding.is_symlink():
+            raise ValueError("replay binding must not be a symlink")
+        if self.run_binding.exists():
+            try:
+                previous = canonical_json(json.loads(self.run_binding.read_text(encoding="utf-8")))
+            except (ValueError, TypeError, OSError):
+                raise ValueError("replay run binding is unreadable; use a new --out-dir") from None
+            if previous != expected:
+                raise ValueError("replay run binding differs; use a new --out-dir")
+        elif self.artifacts.exists() and self.artifacts.stat().st_size:
+            raise ValueError("replay artifacts have no run binding; use a new --out-dir")
+        elif create:
+            with open(self.run_binding, "x", encoding="utf-8") as handle:
+                handle.write(expected + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
 
     def done_ids(self) -> set[str]:
         """Redacted ids with a final attempt; retryable attempts stay eligible for another run."""
         return self.attempt_state()[0]
 
-    def attempt_state(self) -> tuple[set[str], Counter[str]]:
+    def attempt_state(self, *, model_ids: tuple[str, str] | None = None) -> tuple[set[str], Counter[str]]:
         """(ids with a final attempt, number of non-final attempts per id)."""
         done: set[str] = set()
         attempts: Counter[str] = Counter()
@@ -276,6 +334,8 @@ class ReplayWriter:
                     condition_id = payload["condition_id"]
                 except (ValueError, KeyError, TypeError):
                     raise ValueError(f"{self.artifacts} line {number} is not a replay artifact") from None
+                if model_ids is not None and (payload.get("k3_model_id"), payload.get("jev_model_id")) != model_ids:
+                    raise ValueError("replay output contains different model bindings; use a new --out-dir")
                 if is_final(payload):
                     done.add(condition_id)
                 else:
@@ -326,7 +386,9 @@ def run_replay(rows: Iterable[ReplayRow], runner: ShadowRunner, writer: ReplayWr
         raise ValueError("row_headroom_usd must be finite and nonnegative")
     if type(max_attempts) is not int or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer")
-    done, attempts = writer.attempt_state()
+    done, attempts = writer.attempt_state(model_ids=(runner._k3_model_id, runner._jev_model_id))
+    route, test_clients, bindings = runner.replay_setup(budget)
+    writer.validate_run_binding(replay_run_binding(route, test_clients=test_clients, bindings=bindings), create=True)
     statuses: Counter[str] = Counter()
     reasons: Counter[str] = Counter()
     attempted = written = skipped = retryable = exhausted = 0

@@ -17,7 +17,6 @@ import socket
 import sys
 from typing import Any, Mapping
 
-from .anthropic_k3_transport import AnthropicK3Transport
 from .interfaces import ModelUnavailable
 from .jev_client import JevClient
 from .k3_client import K3Client
@@ -26,6 +25,7 @@ from .model_registry import OFFICIAL_KEY_ENV, CostBudget, binding_for, route_for
 # Official credentials a relay client must never see, including ones the SDKs pick up by themselves.
 OFFICIAL_CREDENTIAL_ENV = OFFICIAL_KEY_ENV + ("OPENAI_ADMIN_KEY", "OPENAI_WEBHOOK_SECRET", "ANTHROPIC_AUTH_TOKEN")
 from .openai_jev_transport import OpenAIJevTransport
+from .openai_k3_transport import OpenAIK3Transport
 from .provider_common import register_trusted_client
 
 
@@ -126,21 +126,21 @@ def build_openai_client(*, environ: Mapping[str, str] | None = None, proxy_url: 
     ), route)
 
 
-def build_shadow_models(anthropic_client: Any, openai_client: Any, *, budget: CostBudget,
+def build_shadow_models(k3_client: Any, jev_client: Any, *, budget: CostBudget,
                         network_enabled: bool, allow_test_clients: bool = False,
                         route: str = "official") -> tuple[K3Client, JevClient]:
-    """K3 on the registered Anthropic model, Jev on the registered OpenAI model, one shared budget.
+    """K3 on GPT-6 Astra, Jev on GPT-6.1 Sol (both OpenAI Responses), one shared budget.
 
     allow_test_clients=True accepts offline stand-ins (never unregistered real SDK clients);
     their transport_version carries a "-test-client" suffix in every artifact.
     """
     if type(network_enabled) is not bool:
         raise TypeError("network_enabled must be an explicit boolean")
-    k3 = K3Client(AnthropicK3Transport(anthropic_client, budget=budget, allow_test_client=allow_test_clients,
-                                       route=route),
+    k3 = K3Client(OpenAIK3Transport(k3_client, budget=budget, allow_test_client=allow_test_clients,
+                                     route=route),
                   network_enabled=network_enabled)
     jev = JevClient(model_id=binding_for("JEV").model_id,
-                    transport=OpenAIJevTransport(openai_client, budget=budget, allow_test_client=allow_test_clients,
-                                                 route=route),
+                    transport=OpenAIJevTransport(jev_client, budget=budget, allow_test_client=allow_test_clients,
+                                               route=route),
                     network_enabled=network_enabled)
     return k3, jev

@@ -80,6 +80,9 @@ src/std0_quant/research/agent_shadow/
 
 Core properties:
 
+- registered models: K3 `gpt-6-astra` (7 research calls) and Jev `gpt-6.1-sol` (1 judge call), both using OpenAI Responses with `high` effort, strict JSON, `store=False` and no model fallback. `build_shadow_models(k3_client, jev_client, ...)` now takes two OpenAI clients; the retired Anthropic K3 transport is removed. Both transports are v5; the artifact schema stays v4. [Official model specifications](https://developers.openai.com/api/docs/models/gpt-6-astra) confirm Astra standard input/output rates of $10/$50 per million tokens. Cache reads are conservatively counted at the ordinary input rate, writes at 2.5x, and reservations include that maximum write rate. Missing or malformed cache counters preserve any valid raw count and charge at least the reservation; higher known usage is conservatively priced and can lock the budget. These are estimates for the relay, whose actual billing cannot be verified;
+- replay worker v3 persists `replay_binding.json` before its first call. Models, operational limits, prices, route, test/real provenance, prompt versions and redaction settings must match on resume; budgets and row limits may change. A different binding or legacy artifacts without a binding require a fresh output directory, including previous Fable runs. Both SDK clients are closed after the run and when setup fails;
+- if reported usage implies a cost beyond finite numeric representation, the reservation is released and charged, the full cost is recorded as unknown (`cost_usd=null`, `cost_not_representable`), and the budget locks. `BUDGET_OVERRUN` blocks the row and every later call;
 - fixed analyst roles;
 - one bounded Bull/Bear debate round;
 - one Research Manager synthesis step;

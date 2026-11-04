@@ -1,9 +1,9 @@
 import pytest
 
 from agent_shadow_fakes import FakeReasoner, pit_row
-from agent_shadow_provider_fakes import FakeAnthropicClient, FakeOpenAIClient
+from agent_shadow_provider_fakes import FakeOpenAIK3Client, FakeOpenAIClient
 from std0_quant.research.agent_shadow import provider_clients
-from std0_quant.research.agent_shadow.anthropic_k3_transport import AnthropicK3Transport
+from std0_quant.research.agent_shadow.openai_k3_transport import OpenAIK3Transport
 from std0_quant.research.agent_shadow.interfaces import ModelUnavailable
 from std0_quant.research.agent_shadow.jev_client import JevClient
 from std0_quant.research.agent_shadow.k3_client import K3Client
@@ -18,28 +18,28 @@ RELAY_KEY = {"STD0_RELAY_API_KEY": "sk-relay-test"}
 OFFICIAL_KEYS = {"ANTHROPIC_API_KEY": "sk-ant-test", "OPENAI_API_KEY": "sk-test"}
 
 
-def _relay_clients(monkeypatch, anthropic_fake=None, openai_fake=None):
+def _relay_clients(monkeypatch, k3_fake=None, openai_fake=None):
     """Factory-built relay clients whose request methods answer from offline fakes."""
-    anthropic_client = provider_clients.build_anthropic_client(environ=RELAY_KEY, route="relay_mtu")
+    k3_client = provider_clients.build_openai_client(environ=RELAY_KEY, route="relay_mtu")
     openai_client = provider_clients.build_openai_client(environ=RELAY_KEY, route="relay_mtu")
-    anthropic_fake = anthropic_fake or FakeAnthropicClient()
+    k3_fake = k3_fake or FakeOpenAIK3Client()
     openai_fake = openai_fake or FakeOpenAIClient()
-    monkeypatch.setattr(anthropic_client, "with_options", lambda **options: anthropic_fake)
+    monkeypatch.setattr(k3_client, "with_options", lambda **options: k3_fake)
     monkeypatch.setattr(openai_client, "with_options", lambda **options: openai_fake)
-    return anthropic_client, openai_client
+    return k3_client, openai_client
 
 
-def _official_clients(monkeypatch, anthropic_fake=None, openai_fake=None):
-    anthropic_client = provider_clients.build_anthropic_client(environ=OFFICIAL_KEYS)
+def _official_clients(monkeypatch, k3_fake=None, openai_fake=None):
+    k3_client = provider_clients.build_openai_client(environ=OFFICIAL_KEYS)
     openai_client = provider_clients.build_openai_client(environ=OFFICIAL_KEYS)
-    monkeypatch.setattr(anthropic_client, "with_options", lambda **options: anthropic_fake or FakeAnthropicClient())
+    monkeypatch.setattr(k3_client, "with_options", lambda **options: k3_fake or FakeOpenAIK3Client())
     monkeypatch.setattr(openai_client, "with_options", lambda **options: openai_fake or FakeOpenAIClient())
-    return anthropic_client, openai_client
+    return k3_client, openai_client
 
 
 def _relay_models(monkeypatch, **fakes):
-    anthropic_client, openai_client = _relay_clients(monkeypatch, **fakes)
-    return provider_clients.build_shadow_models(anthropic_client, openai_client, budget=CostBudget(5.0),
+    k3_client, openai_client = _relay_clients(monkeypatch, **fakes)
+    return provider_clients.build_shadow_models(k3_client, openai_client, budget=CostBudget(5.0),
                                                 network_enabled=True, route="relay_mtu")
 
 
@@ -99,35 +99,35 @@ def test_relay_needs_its_key_and_rejects_openai_org_and_project():
 # Transports: a client is trusted only on the route it was built for
 
 def test_clients_cannot_cross_routes_in_transports():
-    relay = provider_clients.build_anthropic_client(environ=RELAY_KEY, route="relay_mtu")
-    official = provider_clients.build_anthropic_client(environ=OFFICIAL_KEYS)
+    relay = provider_clients.build_openai_client(environ=RELAY_KEY, route="relay_mtu")
+    official = provider_clients.build_openai_client(environ=OFFICIAL_KEYS)
     with pytest.raises(ValueError):
-        AnthropicK3Transport(relay, budget=CostBudget(1.0))
+        OpenAIK3Transport(relay, budget=CostBudget(1.0))
     with pytest.raises(ValueError):
-        AnthropicK3Transport(official, budget=CostBudget(1.0), route="relay_mtu")
+        OpenAIK3Transport(official, budget=CostBudget(1.0), route="relay_mtu")
     relay_openai = provider_clients.build_openai_client(environ=RELAY_KEY, route="relay_mtu")
     with pytest.raises(ValueError):
         OpenAIJevTransport(relay_openai, budget=CostBudget(1.0))
-    assert AnthropicK3Transport(relay, budget=CostBudget(1.0), route="relay_mtu").transport_version \
-        == "anthropic-k3-transport-v4-relay-unverified"
+    assert OpenAIK3Transport(relay, budget=CostBudget(1.0), route="relay_mtu").transport_version \
+        == "openai-k3-transport-v5-relay-unverified"
     assert OpenAIJevTransport(relay_openai, budget=CostBudget(1.0), route="relay_mtu").transport_version \
-        == "openai-jev-transport-v4-relay-unverified"
+        == "openai-jev-transport-v5-relay-unverified"
 
 
 def test_relay_test_client_version_marks_both():
-    transport = AnthropicK3Transport(FakeAnthropicClient(), budget=CostBudget(1.0), allow_test_client=True,
+    transport = OpenAIK3Transport(FakeOpenAIK3Client(), budget=CostBudget(1.0), allow_test_client=True,
                                      route="relay_mtu")
-    assert transport.transport_version == "anthropic-k3-transport-v4-relay-unverified-test-client"
+    assert transport.transport_version == "openai-k3-transport-v5-relay-unverified-test-client"
 
 
 # Runner: explicit opt-in, provenance, mixing
 
 def test_relay_rows_are_blocked_before_any_call_without_opt_in(monkeypatch):
-    anthropic_fake, openai_fake = FakeAnthropicClient(), FakeOpenAIClient()
-    k3, jev = _relay_models(monkeypatch, anthropic_fake=anthropic_fake, openai_fake=openai_fake)
+    k3_fake, openai_fake = FakeOpenAIK3Client(), FakeOpenAIClient()
+    k3, jev = _relay_models(monkeypatch, k3_fake=k3_fake, openai_fake=openai_fake)
     result = ShadowRunner(k3, jev).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and result.gate_reasons == ("RELAY_NOT_ALLOWED",)
-    assert not anthropic_fake.calls and not openai_fake.calls and result.model_calls == ()
+    assert not k3_fake.calls and not openai_fake.calls and result.model_calls == ()
     assert (result.route, result.provenance) == ("relay_mtu", "UNVERIFIED_RELAY")
 
 
@@ -136,14 +136,14 @@ def test_opted_in_relay_rows_run_and_are_labelled_unverified(monkeypatch):
     result = ShadowRunner(k3, jev, allow_unverified_relay=True).run(pit_row(), EVIDENCE)
     assert result.gate_status == "SHADOW_ACCEPT"
     assert (result.route, result.provenance) == ("relay_mtu", "UNVERIFIED_RELAY")
-    assert result.k3_transport_version == "anthropic-k3-transport-v4-relay-unverified"
+    assert result.k3_transport_version == "openai-k3-transport-v5-relay-unverified"
     assert len(result.model_calls) == 8
     assert all(call.route == "relay_mtu" and call.test_client is False for call in result.model_calls)
 
 
 def test_official_rows_stay_official(monkeypatch):
-    anthropic_client, openai_client = _official_clients(monkeypatch)
-    k3, jev = provider_clients.build_shadow_models(anthropic_client, openai_client, budget=CostBudget(5.0),
+    k3_client, openai_client = _official_clients(monkeypatch)
+    k3, jev = provider_clients.build_shadow_models(k3_client, openai_client, budget=CostBudget(5.0),
                                                    network_enabled=True)
     result = ShadowRunner(k3, jev, allow_unverified_relay=True).run(pit_row(), EVIDENCE)
     assert (result.route, result.provenance) == ("official", "OFFICIAL")
@@ -151,29 +151,29 @@ def test_official_rows_stay_official(monkeypatch):
 
 
 def test_relay_test_clients_are_labelled_test_client():
-    k3, jev = provider_clients.build_shadow_models(FakeAnthropicClient(), FakeOpenAIClient(), budget=CostBudget(5.0),
+    k3, jev = provider_clients.build_shadow_models(FakeOpenAIK3Client(), FakeOpenAIClient(), budget=CostBudget(5.0),
                                                    network_enabled=True, allow_test_clients=True, route="relay_mtu")
     result = ShadowRunner(k3, jev, allow_unverified_relay=True).run(pit_row(), EVIDENCE)
     assert (result.route, result.provenance) == ("relay_mtu", "TEST_CLIENT")
 
 
 def test_mixed_routes_are_blocked_before_any_call(monkeypatch):
-    anthropic_fake = FakeAnthropicClient()
-    relay_anthropic, _ = _relay_clients(monkeypatch, anthropic_fake=anthropic_fake)
+    k3_fake = FakeOpenAIK3Client()
+    relay_k3, _ = _relay_clients(monkeypatch, k3_fake=k3_fake)
     _, official_openai = _official_clients(monkeypatch)
-    k3 = K3Client(AnthropicK3Transport(relay_anthropic, budget=CostBudget(5.0), route="relay_mtu"),
+    k3 = K3Client(OpenAIK3Transport(relay_k3, budget=CostBudget(5.0), route="relay_mtu"),
                   network_enabled=True)
     jev = JevClient(model_id="gpt-6.1-sol", transport=OpenAIJevTransport(official_openai, budget=CostBudget(5.0)),
                     network_enabled=True)
     result = ShadowRunner(k3, jev, allow_unverified_relay=True).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and result.gate_reasons == ("MODEL_ROUTE_MIXED",)
-    assert not anthropic_fake.calls and result.provenance == "UNSPECIFIED"
+    assert not k3_fake.calls and result.provenance == "UNSPECIFIED"
 
 
 def test_relabelling_a_relay_transport_as_official_is_refused_and_blocks(monkeypatch):
     k3, jev = _relay_models(monkeypatch)
     k3._transport._ledger.route = "official"
-    k3.transport_version = k3._transport.transport_version = "anthropic-k3-transport-v4"
+    k3.transport_version = k3._transport.transport_version = "openai-k3-transport-v5"
     with pytest.raises(ModelUnavailable):
         k3.analyze({"role": "MICROSTRUCTURE"})
     assert k3._transport.drain_call_records()[0].outcome == "CLIENT_UNTRUSTED"
@@ -184,20 +184,20 @@ def test_relabelling_a_relay_transport_as_official_is_refused_and_blocks(monkeyp
 
 def test_dropping_the_relay_suffix_blocks(monkeypatch):
     k3, jev = _relay_models(monkeypatch)
-    jev.transport_version = jev._transport.transport_version = "openai-jev-transport-v4"
+    jev.transport_version = jev._transport.transport_version = "openai-jev-transport-v5"
     result = ShadowRunner(k3, jev, allow_unverified_relay=True).run(pit_row(), EVIDENCE)
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
 
 
 def test_unregistered_models_are_unspecified():
-    _, jev = provider_clients.build_shadow_models(FakeAnthropicClient(), FakeOpenAIClient(), budget=CostBudget(5.0),
+    _, jev = provider_clients.build_shadow_models(FakeOpenAIK3Client(), FakeOpenAIClient(), budget=CostBudget(5.0),
                                                   network_enabled=True, allow_test_clients=True)
     result = ShadowRunner(FakeReasoner(), jev).run(pit_row(), EVIDENCE)
     assert (result.route, result.provenance) == ("unspecified", "UNSPECIFIED")
 
 
 def test_opt_in_must_be_a_real_boolean():
-    k3, jev = provider_clients.build_shadow_models(FakeAnthropicClient(), FakeOpenAIClient(), budget=CostBudget(5.0),
+    k3, jev = provider_clients.build_shadow_models(FakeOpenAIK3Client(), FakeOpenAIClient(), budget=CostBudget(5.0),
                                                    network_enabled=True, allow_test_clients=True)
     with pytest.raises(TypeError):
         ShadowRunner(k3, jev, allow_unverified_relay="yes")
@@ -222,25 +222,25 @@ def _official_jev(monkeypatch, openai_fake=None):
                      network_enabled=True)
 
 
-def _wrapped_relay_k3(monkeypatch, anthropic_fake):
-    relay_anthropic, _ = _relay_clients(monkeypatch, anthropic_fake=anthropic_fake)
-    return _WrappedK3(AnthropicK3Transport(relay_anthropic, budget=CostBudget(5.0), route="relay_mtu"),
+def _wrapped_relay_k3(monkeypatch, k3_fake):
+    relay_k3, _ = _relay_clients(monkeypatch, k3_fake=k3_fake)
+    return _WrappedK3(OpenAIK3Transport(relay_k3, budget=CostBudget(5.0), route="relay_mtu"),
                       network_enabled=True)
 
 
 def test_wrapped_relay_model_cannot_call_without_opt_in(monkeypatch):
-    anthropic_fake = FakeAnthropicClient()
-    k3 = _wrapped_relay_k3(monkeypatch, anthropic_fake)
+    k3_fake = FakeOpenAIK3Client()
+    k3 = _wrapped_relay_k3(monkeypatch, k3_fake)
     result = ShadowRunner(k3, _official_jev(monkeypatch)).run(pit_row(), EVIDENCE)
-    assert not anthropic_fake.calls
+    assert not k3_fake.calls
     assert result.gate_status == "BLOCKED"
 
 
 def test_wrapped_relay_model_cannot_mix_with_an_official_model_even_with_opt_in(monkeypatch):
-    anthropic_fake = FakeAnthropicClient()
-    k3 = _wrapped_relay_k3(monkeypatch, anthropic_fake)
+    k3_fake = FakeOpenAIK3Client()
+    k3 = _wrapped_relay_k3(monkeypatch, k3_fake)
     result = ShadowRunner(k3, _official_jev(monkeypatch), allow_unverified_relay=True).run(pit_row(), EVIDENCE)
-    assert not anthropic_fake.calls
+    assert not k3_fake.calls
     assert result.gate_status == "BLOCKED"
 
 
@@ -258,15 +258,15 @@ def test_relay_calls_outside_any_scope_are_refused_and_opt_in_scopes_allow_them(
     from std0_quant.research.agent_shadow.context import build_shadow_context
     from std0_quant.research.agent_shadow.provider_common import route_policy
 
-    anthropic_fake = FakeAnthropicClient()
-    k3 = _wrapped_relay_k3(monkeypatch, anthropic_fake)
+    k3_fake = FakeOpenAIK3Client()
+    k3 = _wrapped_relay_k3(monkeypatch, k3_fake)
     request = analyst_request("MICROSTRUCTURE", build_shadow_context(pit_row()))
     with pytest.raises(ModelUnavailable):
         k3.analyze(request)
-    assert k3._transport.drain_call_records()[0].outcome == "RELAY_NOT_ALLOWED" and not anthropic_fake.calls
+    assert k3._transport.drain_call_records()[0].outcome == "RELAY_NOT_ALLOWED" and not k3_fake.calls
     with route_policy(allow_unverified_relay=True):
         k3.analyze(request)
-    assert len(anthropic_fake.calls) == 1
+    assert len(k3_fake.calls) == 1
 
 
 def test_a_scope_pins_the_first_route_used(monkeypatch):
@@ -274,9 +274,9 @@ def test_a_scope_pins_the_first_route_used(monkeypatch):
     from std0_quant.research.agent_shadow.context import build_shadow_context
     from std0_quant.research.agent_shadow.provider_common import route_policy
 
-    official_anthropic, _ = _official_clients(monkeypatch)
-    official = K3Client(AnthropicK3Transport(official_anthropic, budget=CostBudget(5.0)), network_enabled=True)
-    relay = _wrapped_relay_k3(monkeypatch, FakeAnthropicClient())
+    official_k3, _ = _official_clients(monkeypatch)
+    official = K3Client(OpenAIK3Transport(official_k3, budget=CostBudget(5.0)), network_enabled=True)
+    relay = _wrapped_relay_k3(monkeypatch, FakeOpenAIK3Client())
     request = analyst_request("MICROSTRUCTURE", build_shadow_context(pit_row()))
     with route_policy(allow_unverified_relay=True):
         official.analyze(request)
@@ -292,20 +292,18 @@ def test_unknown_ledger_route_yields_a_blocked_artifact(monkeypatch):
     assert result.gate_status == "BLOCKED" and "MODEL_PROVENANCE_INVALID" in result.gate_reasons
 
 
-def test_relay_clients_check_the_process_environment_too(monkeypatch):
-    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_WEBHOOK_SECRET"):
-        monkeypatch.setenv(name, "x")
-        with pytest.raises(ModelUnavailable):
-            provider_clients.build_openai_client(environ=RELAY_KEY, route="relay_mtu")
-        with pytest.raises(ModelUnavailable):
-            provider_clients.build_anthropic_client(environ=RELAY_KEY, route="relay_mtu")
-        monkeypatch.delenv(name)
+@pytest.mark.parametrize("name", provider_clients.OFFICIAL_CREDENTIAL_ENV)
+@pytest.mark.parametrize("builder", [provider_clients.build_openai_client, provider_clients.build_anthropic_client])
+def test_relay_clients_check_the_process_environment_too(monkeypatch, name, builder):
+    monkeypatch.setenv(name, "x")
+    with pytest.raises(ModelUnavailable, match=name):
+        builder(environ=RELAY_KEY, route="relay_mtu")
 
 
 def test_test_and_real_clients_cannot_share_a_row_and_real_relay_is_never_hidden(monkeypatch):
     openai_fake = FakeOpenAIClient()
     _, relay_openai = _relay_clients(monkeypatch, openai_fake=openai_fake)
-    k3 = K3Client(AnthropicK3Transport(FakeAnthropicClient(), budget=CostBudget(5.0), allow_test_client=True,
+    k3 = K3Client(OpenAIK3Transport(FakeOpenAIK3Client(), budget=CostBudget(5.0), allow_test_client=True,
                                        route="relay_mtu"), network_enabled=True)
     jev = JevClient(model_id="gpt-6.1-sol", transport=OpenAIJevTransport(relay_openai, budget=CostBudget(5.0),
                                                                         route="relay_mtu"), network_enabled=True)
@@ -342,11 +340,11 @@ def test_trust_requires_the_registered_route_not_just_the_url():
 def test_nested_scopes_only_narrow(monkeypatch):
     from std0_quant.research.agent_shadow.provider_common import route_policy
 
-    anthropic_fake, openai_fake = FakeAnthropicClient(), FakeOpenAIClient()
-    k3, jev = _relay_models(monkeypatch, anthropic_fake=anthropic_fake, openai_fake=openai_fake)
+    k3_fake, openai_fake = FakeOpenAIK3Client(), FakeOpenAIClient()
+    k3, jev = _relay_models(monkeypatch, k3_fake=k3_fake, openai_fake=openai_fake)
     with route_policy("official"):
         result = ShadowRunner(k3, jev, allow_unverified_relay=True).run(pit_row(), EVIDENCE)
-    assert result.gate_status == "BLOCKED" and not anthropic_fake.calls and not openai_fake.calls
+    assert result.gate_status == "BLOCKED" and not k3_fake.calls and not openai_fake.calls
     assert all(call.outcome in ("RELAY_NOT_ALLOWED", "ROUTE_MIXED") for call in result.model_calls)
     with route_policy(allow_unverified_relay=False):
         with route_policy(allow_unverified_relay=True) as inner:
